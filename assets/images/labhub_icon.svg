@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>LabHub</title>
+  <!-- LabHub icon: a circle in four quadrants - video, sound, picture, more. White on transparent. -->
+  <g fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round">
+    <!-- ring and quadrant lines -->
+    <circle cx="256" cy="256" r="226" stroke-width="28"/>
+    <path d="M256 54 V458 M54 256 H458" stroke-width="20"/>
+
+    <!-- video: a screen with a play button (top left) -->
+    <rect x="102" y="128" width="104" height="80" rx="16" stroke-width="16"/>
+    <path d="M144 150 L176 168 L144 186 Z" fill="#fff" stroke-width="8"/>
+
+    <!-- sound: a wave of bars (top right) -->
+    <path d="M314 168 V184 M338 146 V206 M362 126 V226 M386 150 V202 M410 164 V188" stroke-width="16"/>
+
+    <!-- picture: a frame with a sun and hills (bottom left) -->
+    <rect x="102" y="304" width="104" height="80" rx="16" stroke-width="16"/>
+    <circle cx="178" cy="330" r="9" fill="#fff" stroke="none"/>
+    <path d="M112 374 L144 336 L166 360 L180 346 L198 374" stroke-width="12"/>
+
+    <!-- more: a plus (bottom right) -->
+    <path d="M362 310 V402 M316 356 H408" stroke-width="22"/>
+  </g>
+</svg>

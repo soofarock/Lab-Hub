@@ -1,0 +1,19 @@
+{
+  "attributes": {
+    "BlockAhead": {
+      "Bool": true
+    },
+    "Debug": {
+      "Bool": false
+    },
+    "FineBundles": {
+      "String": "steady"
+    },
+    "Manifest": {
+      "String": "Lean"
+    },
+    "SourceFilter": {
+      "Bool": false
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "LabHub",
+  "globIgnorePaths": ["**/README.md"],
+  "tree": {
+    "$path": "src/LabHub"
+  }
+}

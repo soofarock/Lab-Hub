@@ -1,0 +1,127 @@
+{
+  "attributes": {
+    "Admins": {
+      "String": ""
+    },
+    "CachedEntries": {
+      "Float64": 6
+    },
+    "ControlPerSecond": {
+      "Float64": 8
+    },
+    "Debug": {
+      "Bool": false
+    },
+    "HubIcon": {
+      "String": "rbxassetid://75362948591820"
+    },
+    "ImageBlacklist": {
+      "String": ""
+    },
+    "ImageBlacklistEnabled": {
+      "Bool": false
+    },
+    "ImageWhitelist": {
+      "String": "imgur.com, upload.wikimedia.org, cdn.discordapp.com, media.discordapp.net"
+    },
+    "ImageWhitelistEnabled": {
+      "Bool": false
+    },
+    "ImportMaxBytes": {
+      "Float64": 26214400
+    },
+    "ImportMaxPicture": {
+      "Float64": 512
+    },
+    "ImportMaxSeconds": {
+      "Float64": 300
+    },
+    "ImportMaxVideoLines": {
+      "Float64": 480
+    },
+    "ImportVideoQuality": {
+      "String": "144p"
+    },
+    "LibraryDataStore": {
+      "Bool": false
+    },
+    "MaxPlaying": {
+      "Float64": 2
+    },
+    "PatternImage": {
+      "String": "rbxassetid://106064072488154"
+    },
+    "RampImage": {
+      "String": "rbxassetid://91938615950048"
+    },
+    "RequestsPerSecond": {
+      "Float64": 30
+    },
+    "SprayCooldown": {
+      "Float64": 1.5
+    },
+    "SprayDetailDistance": {
+      "Float64": 40
+    },
+    "SprayLifetime": {
+      "Float64": 300
+    },
+    "SprayMaxPerPlayer": {
+      "Float64": 10
+    },
+    "SprayMaxRendered": {
+      "Float64": 24
+    },
+    "SprayOriginalPieces": {
+      "Float64": 9000
+    },
+    "SprayOriginalSize": {
+      "Float64": 512
+    },
+    "SprayPerformanceMode": {
+      "String": "auto"
+    },
+    "SprayPhoneMaxRendered": {
+      "Float64": 8
+    },
+    "SprayPhonePieces": {
+      "Float64": 3500
+    },
+    "SprayPictureSize": {
+      "Float64": 96
+    },
+    "SprayRange": {
+      "Float64": 14
+    },
+    "SprayToolAccess": {
+      "String": "everyone"
+    },
+    "SprayViewDistance": {
+      "Float64": 150
+    },
+    "TVScale": {
+      "Float64": 5
+    },
+    "TVToolAccess": {
+      "String": "everyone"
+    },
+    "ToolAccessList": {
+      "String": ""
+    },
+    "UrlMaxBytes": {
+      "Float64": 4194304
+    },
+    "UrlPictureSize": {
+      "Float64": 512
+    },
+    "ViewDistance": {
+      "Float64": 120
+    },
+    "YouTubeHelper": {
+      "String": "http://localhost:8787"
+    },
+    "YouTubeHelperKey": {
+      "String": ""
+    }
+  }
+}
