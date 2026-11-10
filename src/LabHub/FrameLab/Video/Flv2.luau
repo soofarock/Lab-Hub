@@ -10,7 +10,8 @@
 --   * an adaptive binary range coder (LZMA style) with contexts, coder streams per chunk (a chunk starts with a
 --     keyframe every 4 s, so seeking only decodes from the last keyframe)
 --   * two layers: every other frame is droppable (predicted from the last reference frame, never used as one, coded
---     in the chunk's second stream), so a slow device can skip half the decoding (r.SkipDroppable) and show 12 fps
+--     in the chunk's second stream), so a slow device can skip half the decoding (r.SkipDroppable) and show 12 fps;
+--     droppable frames are coded at 0.7 of the quality (DroppableQuality): about 6% fewer bytes for the same picture
 --   * rate control: the encoder keeps to a byte budget per second (TargetKBps), averaged over RateWindow seconds
 --     (default 3): a busy scene (everything moving) borrows bytes from the quiet seconds around it instead of dropping
 --     to a coarse quality at once (that left whole moving areas as stale or smeared blocks). The quality stays between
@@ -22,13 +23,25 @@
 --   local w = Flv2.writer(width, height, fps, { TargetKBps = 25, Quality = 50, KeyEvery, Search, Layers = 2, RateWindow = 3 })
 --   w:add(image)           -- { width, height, data = RGBA buffer }
 --   local bytes, stats = w:finish()
+-- A long video can be written in parts at once (one writer each, every part a whole number of chunks: KeyEvery frames,
+-- 4 s by default), then put together:
+--   local w = Flv2.writer(width, height, fps, { ..., FirstFrame = k })   -- this part starts at frame k of the video
+--   local part = w:finishPart()           -- { chunks, frames, stats }
+--   local bytes, stats = Flv2.assemble({ part1, part2, ... }, width, height, fps, keyEvery, layers)
+-- Renditions: one video at several sizes in one entry ("FLVS"), so each device plays the size it can keep up with:
+--   local bytes = Flv2.packSet({ { bytes = flv2, width, height, bytesPerSecond }, ... })   (largest first)
+--   Flv2.readSet(bytes) -> { { offset, size, width, height, bytesPerSecond }, ... } or nil (not a set)
+--   Flv2.pick(list, lines) -> index of the largest rendition at most `lines` tall (else the smallest)
+--   Video.Stream.reader opens a set at the size Video.Stream.deviceLines() picks (or options.Rendition)
 -- Reading (player): the same reader as FLV1 streams
 --   local r = Flv2.reader(bytes)
 --   r.width, r.height, r.fps, r.frameCount, r.duration, r.pw (row stride of r.rgba is pw * 4), r.bw (8 x 8 blocks per row)
 --   local info = r:advance()    -- next frame; info = { key, dx, dy, blocks = { 8 x 8 block ids that changed } }
 --   r.render()                  -- brings r.rgba up to the last frame (call before reading pixels)
 --   r.SkipDroppable = true      -- runtime: skip droppable frames from the next chunk on (about half the decode work)
+--   r.FastColour = true         -- runtime: colour without the chroma blend (about half the work of render)
 --   r:seek(frame)               -- 0-based
+--   r.bytes                     -- the bytes it was opened with
 --   r.frame
 
 local Flv2 = {}
@@ -42,14 +55,6 @@ local NB = 8
 local floor, abs, min, max = math.floor, math.abs, math.min, math.max
 local readu8, writeu8 = buffer.readu8, buffer.writeu8
 
--- float forward DCT basis (encoder only)
-local KF = table.create(64)
-for x = 0, 7 do
-	for u = 0, 7 do
-		local cu = (u == 0) and math.sqrt(0.5) or 1
-		KF[x * 8 + u + 1] = cu / 2 * math.cos((2 * x + 1) * u * math.pi / 16)
-	end
-end
 local ZIGZAG = {
 	0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
 	35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
@@ -448,26 +453,55 @@ local function idct(C, out, last)
 end
 Flv2.idct = idct
 
--- float forward DCT (encoder): f (64 row-major [y][x]) -> F (64 row-major [v][u])
-local tF = table.create(64, 0)
-local function fdct(f, F)
-	for y = 0, 7 do
-		local o = y * 8
-		local a0, a1, a2, a3, a4, a5, a6, a7 = f[o + 1], f[o + 2], f[o + 3], f[o + 4], f[o + 5], f[o + 6], f[o + 7], f[o + 8]
-		for u = 1, 8 do
-			tF[o + u] = a0 * KF[u] + a1 * KF[8 + u] + a2 * KF[16 + u] + a3 * KF[24 + u] + a4 * KF[32 + u] + a5 * KF[40 + u]
-				+ a6 * KF[48 + u] + a7 * KF[56 + u]
-		end
+-- float forward DCT (encoder): f (64 row-major [y][x]) -> F (64 row-major [v][u]), the JPEG DCT.
+-- Worked out with the AAN factorisation (as libjpeg's jfdctflt.c: 5 multiplies a row) and scaled once at the end.
+local AANS = table.create(64, 0)
+do
+	local s = table.create(8, 1)
+	for k = 1, 7 do
+		s[k + 1] = math.cos(k * math.pi / 16) * math.sqrt(2)
 	end
 	for v = 0, 7 do
-		local k0, k1, k2, k3, k4, k5, k6, k7 = KF[v + 1], KF[8 + v + 1], KF[16 + v + 1], KF[24 + v + 1], KF[32 + v + 1], KF[40 + v + 1],
-			KF[48 + v + 1], KF[56 + v + 1]
-		for u = 1, 8 do
-			F[v * 8 + u] = k0 * tF[u] + k1 * tF[8 + u] + k2 * tF[16 + u] + k3 * tF[24 + u] + k4 * tF[32 + u] + k5 * tF[40 + u]
-				+ k6 * tF[48 + u] + k7 * tF[56 + u]
+		for u = 0, 7 do
+			AANS[v * 8 + u + 1] = 1 / (8 * s[v + 1] * s[u + 1])
 		end
 	end
 end
+local tF = table.create(64, 0)
+local function fdct(f, F)
+	for o = 0, 56, 8 do
+		local d0, d1, d2, d3, d4, d5, d6, d7 = f[o + 1], f[o + 2], f[o + 3], f[o + 4], f[o + 5], f[o + 6], f[o + 7], f[o + 8]
+		local t0, t7, t1, t6, t2, t5, t3, t4 = d0 + d7, d0 - d7, d1 + d6, d1 - d6, d2 + d5, d2 - d5, d3 + d4, d3 - d4
+		local t10, t13, t11, t12 = t0 + t3, t0 - t3, t1 + t2, t1 - t2
+		tF[o + 1], tF[o + 5] = t10 + t11, t10 - t11
+		local z1 = (t12 + t13) * 0.70710678118654752
+		tF[o + 3], tF[o + 7] = t13 + z1, t13 - z1
+		t10, t11, t12 = t4 + t5, t5 + t6, t6 + t7
+		local z5 = (t10 - t12) * 0.38268343236508977
+		local z2 = 0.54119610014619698 * t10 + z5
+		local z4 = 1.30656296487637652 * t12 + z5
+		local z3 = t11 * 0.70710678118654752
+		local z11, z13 = t7 + z3, t7 - z3
+		tF[o + 6], tF[o + 4], tF[o + 2], tF[o + 8] = z13 + z2, z13 - z2, z11 + z4, z11 - z4
+	end
+	for u = 1, 8 do
+		local d0, d1, d2, d3, d4, d5, d6, d7 = tF[u], tF[8 + u], tF[16 + u], tF[24 + u], tF[32 + u], tF[40 + u], tF[48 + u], tF[56 + u]
+		local t0, t7, t1, t6, t2, t5, t3, t4 = d0 + d7, d0 - d7, d1 + d6, d1 - d6, d2 + d5, d2 - d5, d3 + d4, d3 - d4
+		local t10, t13, t11, t12 = t0 + t3, t0 - t3, t1 + t2, t1 - t2
+		F[u], F[32 + u] = (t10 + t11) * AANS[u], (t10 - t11) * AANS[32 + u]
+		local z1 = (t12 + t13) * 0.70710678118654752
+		F[16 + u], F[48 + u] = (t13 + z1) * AANS[16 + u], (t13 - z1) * AANS[48 + u]
+		t10, t11, t12 = t4 + t5, t5 + t6, t6 + t7
+		local z5 = (t10 - t12) * 0.38268343236508977
+		local z2 = 0.54119610014619698 * t10 + z5
+		local z4 = 1.30656296487637652 * t12 + z5
+		local z3 = t11 * 0.70710678118654752
+		local z11, z13 = t7 + z3, t7 - z3
+		F[40 + u], F[24 + u], F[8 + u], F[56 + u] = (z13 + z2) * AANS[40 + u], (z13 - z2) * AANS[24 + u], (z11 + z4) * AANS[8 + u],
+			(z11 - z4) * AANS[56 + u]
+	end
+end
+Flv2.fdct = fdct
 
 -- ------------------------------------------------------------------------------------------- prediction
 -- n x n block of plane (w x h bytes) at quarter-pixel position (x4 / 4, y4 / 4) into out (row-major, 1-based),
@@ -610,6 +644,32 @@ local function toRGBA(Y, Cb, Cr, PW, PH, rgba, x0, y0, x1, y1)
 end
 Flv2.toRGBA = toRGBA
 
+-- the same with each 2 x 2 pixels sharing their chroma sample (no blend): about half the work, for slow devices
+-- (the strips drawn from the picture don't show the difference)
+local function toRGBAFast(Y, Cb, Cr, PW, PH, rgba, x0, y0, x1, y1)
+	local CW = PW // 2
+	local i0, i1 = x0 // 2, (x1 + 1) // 2 - 1
+	for j = y0 // 2, (y1 + 1) // 2 - 1 do
+		local rj = j * CW
+		for i = i0, i1 do
+			local cb, cr = readu8(Cb, rj + i) + 1, readu8(Cr, rj + i) + 1
+			local ro, go, bo = RCR[cr], (GCB[cb] + GCR[cr]) // 256, BCB[cb]
+			local yo = 2 * j * PW + 2 * i
+			local o = yo * 4
+			local l = readu8(Y, yo) + 401
+			writeu32(rgba, o, CL[l + ro] + 256 * CL[l - go] + 65536 * CL[l + bo] + A255)
+			l = readu8(Y, yo + 1) + 401
+			writeu32(rgba, o + 4, CL[l + ro] + 256 * CL[l - go] + 65536 * CL[l + bo] + A255)
+			yo += PW
+			o = yo * 4
+			l = readu8(Y, yo) + 401
+			writeu32(rgba, o, CL[l + ro] + 256 * CL[l - go] + 65536 * CL[l + bo] + A255)
+			l = readu8(Y, yo + 1) + 401
+			writeu32(rgba, o + 4, CL[l + ro] + 256 * CL[l - go] + 65536 * CL[l + bo] + A255)
+		end
+	end
+end
+
 local function pad16(n)
 	return (n + 15) // 16 * 16
 end
@@ -691,7 +751,9 @@ end
 
 -- ------------------------------------------------------------------------------------------- reader
 -- options.Ready(chunkIndex) -> bool: for a video still arriving (streamed from the server), whether that chunk's bytes
--- are in place yet; the player waits for it (r:ready(frame))
+-- are in place yet; the player waits for it (r:ready(frame)). options.ChunkData(chunkIndex) -> buffer, offset [, sizeA,
+-- sizeB]: where a chunk's bytes are when they are kept apart from `bytes` (which then needs only the header and chunk
+-- directory), and the sizes of its two coder streams when the directory doesn't have them (a stream made as it plays)
 function Flv2.reader(bytes, options)
 	options = options or {}
 	local b = type(bytes) == "string" and buffer.fromstring(bytes) or bytes
@@ -700,6 +762,7 @@ function Flv2.reader(bytes, options)
 	end
 	local r = {}
 	r.codec = "FLV2"
+	r.bytes = b -- (what the reader was opened with: the whole video, or its header and directory)
 	r.fps = readu8(b, 5)
 	r.width, r.height = buffer.readu16(b, 6), buffer.readu16(b, 8)
 	r.frameCount = buffer.readu32(b, 10)
@@ -746,8 +809,20 @@ function Flv2.reader(bytes, options)
 
 	local function openChunk(i)
 		local c = r.chunks[i]
-		bitA, directA = newDecoder(b, c.off, c.sizeA)
-		bitB, directB = newDecoder(b, c.off + c.sizeA, c.sizeB)
+		local src, base = b, c.off
+		local sizeA, sizeB = c.sizeA, c.sizeB
+		if options.ChunkData then
+			local sA, sB
+			src, base, sA, sB = options.ChunkData(i)
+			if not src then
+				error(("FLV2: chunk %d isn't loaded"):format(i), 0)
+			end
+			if sA then
+				sizeA, sizeB = sA, sB
+			end
+		end
+		bitA, directA = newDecoder(src, base, sizeA)
+		bitB, directB = newDecoder(src, base + sizeA, sizeB)
 		mA, mB = newModels(), newModels()
 		chunkIndex, chunkFirst = i, c.first
 		bOn = not r.SkipDroppable
@@ -932,6 +1007,7 @@ function Flv2.reader(bytes, options)
 			return
 		end
 		local Y, Cb, Cr, rgba = shown.Y, shown.Cb, shown.Cr, r.rgba
+		local convert = r.FastColour and toRGBAFast or toRGBA
 		for j = 0, CH - 1 do
 			local o = j * CW
 			local i = 0
@@ -941,7 +1017,7 @@ function Flv2.reader(bytes, options)
 					while i1 + 1 < CW and readu8(mark, o + i1 + 1) == 1 do
 						i1 += 1
 					end
-					toRGBA(Y, Cb, Cr, PW, PH, rgba, 2 * i, 2 * j, 2 * i1 + 2, 2 * j + 2)
+					convert(Y, Cb, Cr, PW, PH, rgba, 2 * i, 2 * j, 2 * i1 + 2, 2 * j + 2)
 					i = i1 + 1
 				else
 					i += 1
@@ -1112,7 +1188,9 @@ function Flv2.writer(width, height, fps, options)
 	local rateWindow = options.RateWindow or 3
 	local qMin, qMax = options.MinQuality or 20, options.MaxQuality or 75
 	local layers = (options.Layers == 1) and 1 or 2
+	local dropQuality = options.DroppableQuality or 0.7 -- a droppable frame's quality, as a share of the others'
 	local frames = 0
+	local firstFrame = options.FirstFrame or 0 -- where this part starts in the whole video (chunk directory)
 	local chunks = {}
 	local E, m, EA, mA, EB, mB
 	local chunkFirst, chunkBytes0 = 0, 0
@@ -1220,7 +1298,7 @@ function Flv2.writer(width, height, fps, options)
 
 	local function startChunk()
 		if EA then
-			table.insert(chunks, { first = chunkFirst, a = EA.finish(), b = EB.finish() })
+			table.insert(chunks, { first = firstFrame + chunkFirst, a = EA.finish(), b = EB.finish() })
 		end
 		EA, EB = newEncoder(), newEncoder()
 		mA, mB = newModels(), newModels()
@@ -1241,31 +1319,145 @@ function Flv2.writer(width, height, fps, options)
 		fdct(blk, F)
 	end
 
-	-- every coefficient of the residual against the prediction quantises to zero
-	local function quantZero(tl, tc)
-		for bi = 0, 3 do
-			local ox, oy = (bi % 2) * 8, (bi // 2) * 8
-			residualDct(sy, 16, ox, oy, predY, 16, ox, oy)
-			for k = 1, 64 do
-				if abs(F[k]) / tl[k] + 0.3 >= 1 then
-					return false
-				end
+	-- whether every coefficient of an 8 x 8 residual (source block minus prediction) quantises to zero with table tab
+	-- (lowest step tmin). Two shortcuts before the transform: the DC coefficient is the sum / 8 (a block whose average
+	-- moved is coded), and the transform keeps the energy, so a residual with less energy than (0.7 x the smallest
+	-- step)^2 has no coefficient that reaches a step
+	local function blockZero(src, sw, sx, sy_, pred, pw, px, py, tab, tmin)
+		local sum, e2 = 0, 0
+		for yy = 0, 7 do
+			local s = (sy_ + yy) * sw + sx
+			local p = (py + yy) * pw + px
+			for xx = 1, 8 do
+				local d = src[s + xx] - pred[p + xx]
+				sum += d
+				e2 += d * d
 			end
 		end
-		residualDct(scb, 8, 0, 0, predCb, 8, 0, 0)
-		for k = 1, 64 do
-			if abs(F[k]) / tc[k] + 0.3 >= 1 then
-				return false
-			end
+		if abs(sum) * 0.125 / tab[1] + 0.3 >= 1 then
+			return false
 		end
-		residualDct(scr, 8, 0, 0, predCr, 8, 0, 0)
+		if e2 < 0.49 * tmin * tmin then
+			return true
+		end
+		residualDct(src, sw, sx, sy_, pred, pw, px, py)
 		for k = 1, 64 do
-			if abs(F[k]) / tc[k] + 0.3 >= 1 then
+			if abs(F[k]) / tab[k] + 0.3 >= 1 then
 				return false
 			end
 		end
 		return true
 	end
+
+	-- every coefficient of the residual against the prediction quantises to zero
+	local function quantZero(tl, tc, tlMin, tcMin)
+		for bi = 0, 3 do
+			local ox, oy = (bi % 2) * 8, (bi // 2) * 8
+			if not blockZero(sy, 16, ox, oy, predY, 16, ox, oy, tl, tlMin) then
+				return false
+			end
+		end
+		return blockZero(scb, 8, 0, 0, predCb, 8, 0, 0, tc, tcMin) and blockZero(scr, 8, 0, 0, predCr, 8, 0, 0, tc, tcMin)
+	end
+
+	-- the macroblock being coded (luma pixels), the whole-picture slide and the search range (quarter pixels)
+	local mbX, mbY, GX, GY, S2 = 0, 0, 0, 0, 0
+
+	-- the prediction from the reference picture at quarter-pixel motion (ax, ay)
+	local function predict(ax, ay)
+		local cvx, cvy = chromaMv(ax), chromaMv(ay)
+		fetchQ(prev.Y, PW, PH, 4 * mbX + ax, 4 * mbY + ay, 16, predY)
+		fetchQ(prev.Cb, CW, CH, 2 * mbX + cvx, 2 * mbY + cvy, 8, predCb)
+		fetchQ(prev.Cr, CW, CH, 2 * mbX + cvx, 2 * mbY + cvy, 8, predCr)
+	end
+
+	-- sum of absolute differences against the reference at (ax, ay) quarter pixels; stops once past `best` (that
+	-- candidate loses anyway). Whole-pixel positions read the reference directly.
+	local function sad(ax, ay, best)
+		local x4, y4 = 4 * mbX + ax, 4 * mbY + ay
+		local ix, iy = x4 // 4, y4 // 4
+		local s = 0
+		if x4 % 4 == 0 and y4 % 4 == 0 and ix >= 0 and iy >= 0 and ix + 16 < PW and iy + 16 < PH then
+			local P = prev.Y
+			for r = 0, 15 do
+				local o = (iy + r) * PW + ix - 1
+				local d = r * 16
+				for c = 1, 16 do
+					s += abs(sy[d + c] - readu8(P, o + c))
+				end
+				if s >= best then
+					return s
+				end
+			end
+			return s
+		end
+		local fx, fy = x4 % 4, y4 % 4
+		if ix >= 0 and iy >= 0 and ix + 16 < PW and iy + 16 < PH then
+			-- inside the picture: the bilinear prediction (as fetchQ) worked out row by row, so a losing candidate stops
+			-- early
+			local P = prev.Y
+			if fy == 0 then
+				local wa = 4 - fx
+				for r = 0, 15 do
+					local o = (iy + r) * PW + ix
+					local d = r * 16
+					local a = readu8(P, o)
+					for c = 1, 16 do
+						local bb = readu8(P, o + c)
+						s += abs(sy[d + c] - (wa * a + fx * bb + 2) // 4)
+						a = bb
+					end
+					if s >= best then
+						return s
+					end
+				end
+			elseif fx == 0 then
+				local wa = 4 - fy
+				for r = 0, 15 do
+					local o = (iy + r) * PW + ix - 1
+					local d = r * 16
+					for c = 1, 16 do
+						s += abs(sy[d + c] - (wa * readu8(P, o + c) + fy * readu8(P, o + PW + c) + 2) // 4)
+					end
+					if s >= best then
+						return s
+					end
+				end
+			else
+				local wa, wb, wc, wd = (4 - fx) * (4 - fy), fx * (4 - fy), (4 - fx) * fy, fx * fy
+				for r = 0, 15 do
+					local o = (iy + r) * PW + ix
+					local d = r * 16
+					local a, cc = readu8(P, o), readu8(P, o + PW)
+					for c = 1, 16 do
+						local bb, dd = readu8(P, o + c), readu8(P, o + PW + c)
+						s += abs(sy[d + c] - (wa * a + wb * bb + wc * cc + wd * dd + 8) // 16)
+						a, cc = bb, dd
+					end
+					if s >= best then
+						return s
+					end
+				end
+			end
+			return s
+		end
+		fetchQ(prev.Y, PW, PH, x4, y4, 16, tmpY)
+		for r = 0, 15 do
+			local d = r * 16
+			for c = 1, 16 do
+				s += abs(sy[d + c] - tmpY[d + c])
+			end
+			if s >= best then
+				return s
+			end
+		end
+		return s
+	end
+
+	local function inRange(ax, ay)
+		return abs(ax - GX) <= S2 and abs(ay - GY) <= S2
+	end
+	local STEPS, SUBSTEPS = { 32, 16, 8, 4 }, { 2, 1 }
 
 	local function writeBlock(plane, pw, px, py, pred, sw, ox, oy, withRes)
 		for yy = 0, 7 do
@@ -1305,23 +1497,28 @@ function Flv2.writer(width, height, fps, options)
 			E, m = EA, mA
 		end
 		E.direct(key and 1 or 0, 1)
-		E.direct(q, 7)
+		-- (a droppable frame is coded coarser: nothing is predicted from it, so its error doesn't carry on, and its
+		-- bytes go to the frames that are)
+		local fq = droppable and max(1, floor(q * dropQuality + 0.5)) or q
+		E.direct(fq, 7)
 		E.direct(gx + 64, 7)
 		E.direct(gy + 64, 7)
-		local tabs = qtables(q)
+		local tabs = qtables(fq)
 		local tl, tc = tabs[2], tabs[4]
+		local tlMin, tcMin = math.min(table.unpack(tl)), math.min(table.unpack(tc))
 		cur = droppable and drop or work
 		local Y, Cb, Cr = cur.Y, cur.Cb, cur.Cr
-		local GX, GY = 4 * gx, 4 * gy
+		GX, GY = 4 * gx, 4 * gy
 		for i = 1, nMB do
 			hasMv[i] = false
 		end
-		local S2 = search * 4
+		S2 = search * 4
 		for mby = 0, MBH - 1 do
 			local dc0, dc1, dc2 = 0, 0, 0
 			for mbx = 0, MBW - 1 do
 				local idx = mby * MBW + mbx + 1
 				local x, y = mbx * 16, mby * 16
+				mbX, mbY = x, y
 				for r = 0, 15 do
 					local s = (y + r) * PW + x
 					for c = 1, 16 do
@@ -1349,64 +1546,33 @@ function Flv2.writer(width, height, fps, options)
 						rx, ry = mvx[idx - MBW + 1], mvy[idx - MBW + 1]
 					end
 					local pdx, pdy = median3(lx, tx, rx), median3(ly, ty, ry)
-					local function predict(ax, ay)
-						local cvx, cvy = chromaMv(ax), chromaMv(ay)
-						fetchQ(prev.Y, PW, PH, 4 * x + ax, 4 * y + ay, 16, predY)
-						fetchQ(prev.Cb, CW, CH, 2 * x + cvx, 2 * y + cvy, 8, predCb)
-						fetchQ(prev.Cr, CW, CH, 2 * x + cvx, 2 * y + cvy, 8, predCr)
-					end
 					predict(GX, GY)
-					if quantZero(tl, tc) then
+					if quantZero(tl, tc, tlMin, tcMin) then
 						mode = MODE_SKIP
 					else
-						-- sum of absolute differences against the reference at (ax, ay) quarter pixels; stops once past
-						-- `best` (that candidate loses anyway). Whole-pixel positions read the reference directly.
-						-- (with the cheaper slide search: ~27% less encoding time per frame)
-						local function sad(ax, ay, best)
-							local x4, y4 = 4 * x + ax, 4 * y + ay
-							local ix, iy = x4 // 4, y4 // 4
-							local s = 0
-							if x4 % 4 == 0 and y4 % 4 == 0 and ix >= 0 and iy >= 0 and ix + 16 < PW and iy + 16 < PH then
-								local P = prev.Y
-								for r = 0, 15 do
-									local o = (iy + r) * PW + ix - 1
-									local d = r * 16
-									for c = 1, 16 do
-										s += abs(sy[d + c] - readu8(P, o + c))
-									end
-									if s >= best then
-										return s
-									end
-								end
-								return s
-							end
-							fetchQ(prev.Y, PW, PH, x4, y4, 16, tmpY)
-							for r = 0, 15 do
-								local d = r * 16
-								for c = 1, 16 do
-									s += abs(sy[d + c] - tmpY[d + c])
-								end
-								if s >= best then
-									return s
-								end
-							end
-							return s
-						end
-						local function ok(ax, ay)
-							return abs(ax - GX) <= S2 and abs(ay - GY) <= S2
-						end
+						-- start from the best of: the slide, no motion, the predicted motion and the neighbours' (whole
+						-- pixels), then a diamond search in whole pixels, then half and quarter pixels around the best
 						local bvx, bvy, bs = GX, GY, sad(GX, GY, math.huge)
-						local cands = { 0, 0, pdx, pdy, lx, ly, tx, ty }
-						for ci = 1, 7, 2 do
-							local cx, cy = cands[ci] - cands[ci] % 4, cands[ci + 1] - cands[ci + 1] % 4
-							if ok(cx, cy) then
+						for ci = 1, 4 do
+							local cx, cy
+							if ci == 1 then
+								cx, cy = 0, 0
+							elseif ci == 2 then
+								cx, cy = pdx, pdy
+							elseif ci == 3 then
+								cx, cy = lx, ly
+							else
+								cx, cy = tx, ty
+							end
+							cx, cy = cx - cx % 4, cy - cy % 4
+							if inRange(cx, cy) then
 								local s = sad(cx, cy, bs)
 								if s < bs then
 									bvx, bvy, bs = cx, cy, s
 								end
 							end
 						end
-						for _, step in ipairs({ 32, 16, 8, 4 }) do
+						for _, step in STEPS do
 							local moved = true
 							while moved do
 								moved = false
@@ -1422,7 +1588,7 @@ function Flv2.writer(width, height, fps, options)
 									else
 										cy -= step
 									end
-									if ok(cx, cy) then
+									if inRange(cx, cy) then
 										local s = sad(cx, cy, bs)
 										if s < bs then
 											bvx, bvy, bs = cx, cy, s
@@ -1432,13 +1598,13 @@ function Flv2.writer(width, height, fps, options)
 								end
 							end
 						end
-						for _, sub in ipairs({ 2, 1 }) do
+						for _, sub in SUBSTEPS do
 							local bx, by = bvx, bvy
 							for ddx = -sub, sub, sub do
 								for ddy = -sub, sub, sub do
 									if ddx ~= 0 or ddy ~= 0 then
 										local cx, cy = bx + ddx, by + ddy
-										if ok(cx, cy) then
+										if inRange(cx, cy) then
 											local s = sad(cx, cy, bs)
 											if s < bs then
 												bvx, bvy, bs = cx, cy, s
@@ -1657,46 +1823,138 @@ function Flv2.writer(width, height, fps, options)
 		return cur.Y, cur.Cb, cur.Cr
 	end
 
-	function w:finish()
+	-- this part's chunks (Flv2.assemble puts parts together)
+	function w:finishPart()
 		if EA then
-			table.insert(chunks, { first = chunkFirst, a = EA.finish(), b = EB.finish() })
+			table.insert(chunks, { first = firstFrame + chunkFirst, a = EA.finish(), b = EB.finish() })
 			EA, EB, E = nil, nil, nil
 		end
-		local total = 0
-		for _, c in ipairs(chunks) do
-			total += buffer.len(c.a) + buffer.len(c.b)
-		end
-		local dirSize = #chunks * DIR_ENTRY
-		local out = buffer.create(HEADER + dirSize + total)
-		buffer.writestring(out, 0, Flv2.Magic)
-		writeu8(out, 4, 1)
-		writeu8(out, 5, fps)
-		buffer.writeu16(out, 6, width)
-		buffer.writeu16(out, 8, height)
-		buffer.writeu32(out, 10, frames)
-		buffer.writeu16(out, 14, keyEvery)
-		buffer.writeu16(out, 16, #chunks)
-		writeu8(out, 18, layers)
-		local off = 0
-		for i, c in ipairs(chunks) do
-			local d = HEADER + (i - 1) * DIR_ENTRY
-			buffer.writeu32(out, d, off)
-			buffer.writeu32(out, d + 4, buffer.len(c.a))
-			buffer.writeu32(out, d + 8, buffer.len(c.b))
-			buffer.writeu32(out, d + 12, c.first)
-			buffer.copy(out, HEADER + dirSize + off, c.a, 0)
-			buffer.copy(out, HEADER + dirSize + off + buffer.len(c.a), c.b, 0)
-			off += buffer.len(c.a) + buffer.len(c.b)
-		end
-		stats.frames = frames
-		stats.bytes = buffer.len(out)
-		stats.seconds = frames / fps
-		stats.bytesPerSecond = stats.bytes / math.max(stats.seconds, 1e-9)
-		stats.codec = "FLV2"
-		return out, stats
+		return { chunks = chunks, frames = frames, stats = stats, keyEvery = keyEvery, layers = layers, firstFrame = firstFrame }
+	end
+
+	function w:finish()
+		return Flv2.assemble({ w:finishPart() }, width, height, fps, keyEvery, layers)
 	end
 
 	return w
+end
+
+-- ------------------------------------------------------------------------------------------- renditions
+-- "FLVS", version u8 (1), count u8, 2 bytes reserved, then 16 bytes per rendition: offset u32 (from the start), size
+-- u32, width u16, height u16, bytes per second u32; the FLV2 streams follow
+Flv2.SetMagic = "FLVS"
+local SET_HEAD, SET_ENTRY = 8, 16
+
+function Flv2.packSet(list)
+	local total = SET_HEAD + #list * SET_ENTRY
+	for _, e in ipairs(list) do
+		total += buffer.len(e.bytes)
+	end
+	local out = buffer.create(total)
+	buffer.writestring(out, 0, Flv2.SetMagic)
+	writeu8(out, 4, 1)
+	writeu8(out, 5, #list)
+	local off = SET_HEAD + #list * SET_ENTRY
+	for i, e in ipairs(list) do
+		local d = SET_HEAD + (i - 1) * SET_ENTRY
+		buffer.writeu32(out, d, off)
+		buffer.writeu32(out, d + 4, buffer.len(e.bytes))
+		buffer.writeu16(out, d + 8, e.width)
+		buffer.writeu16(out, d + 10, e.height)
+		buffer.writeu32(out, d + 12, math.floor(e.bytesPerSecond or 0))
+		buffer.copy(out, off, e.bytes, 0)
+		off += buffer.len(e.bytes)
+	end
+	return out
+end
+
+function Flv2.isSet(b)
+	return buffer.len(b) >= SET_HEAD and buffer.readstring(b, 0, 4) == Flv2.SetMagic
+end
+
+-- the set's table of renditions (needs only the first 8 + 16 x count bytes)
+function Flv2.readSet(b)
+	if not Flv2.isSet(b) then
+		return nil
+	end
+	local list = {}
+	for i = 1, readu8(b, 5) do
+		local d = SET_HEAD + (i - 1) * SET_ENTRY
+		if d + SET_ENTRY > buffer.len(b) then
+			break
+		end
+		list[i] = { offset = buffer.readu32(b, d), size = buffer.readu32(b, d + 4), width = buffer.readu16(b, d + 8),
+			height = buffer.readu16(b, d + 10), bytesPerSecond = buffer.readu32(b, d + 12) }
+	end
+	return list
+end
+Flv2.setHeadSize = function(count)
+	return SET_HEAD + count * SET_ENTRY
+end
+
+function Flv2.pick(list, lines)
+	local best, smallest
+	for i, e in ipairs(list) do
+		local l = math.min(e.width, e.height)
+		if l <= lines and (not best or l > math.min(list[best].width, list[best].height)) then
+			best = i
+		end
+		if not smallest or l < math.min(list[smallest].width, list[smallest].height) then
+			smallest = i
+		end
+	end
+	return best or smallest or 1
+end
+
+-- parts (from w:finishPart(), in order) -> the video's bytes, stats
+function Flv2.assemble(parts, width, height, fps, keyEvery, layers)
+	local chunks, frames = {}, 0
+	local stats = { skip = 0, inter = 0, intra = 0, slides = 0, keyframes = 0, qMin = 100, qMax = 0 }
+	for _, p in ipairs(parts) do
+		for _, c in ipairs(p.chunks) do
+			table.insert(chunks, c)
+		end
+		frames = math.max(frames, p.firstFrame + p.frames)
+		local st = p.stats
+		for _, k in ipairs({ "skip", "inter", "intra", "slides", "keyframes" }) do
+			stats[k] += st[k] or 0
+		end
+		if (st.qMax or 0) > 0 then
+			stats.qMin, stats.qMax = min(stats.qMin, st.qMin), max(stats.qMax, st.qMax)
+		end
+	end
+	local total = 0
+	for _, c in ipairs(chunks) do
+		total += buffer.len(c.a) + buffer.len(c.b)
+	end
+	local dirSize = #chunks * DIR_ENTRY
+	local out = buffer.create(HEADER + dirSize + total)
+	buffer.writestring(out, 0, Flv2.Magic)
+	writeu8(out, 4, 1)
+	writeu8(out, 5, fps)
+	buffer.writeu16(out, 6, width)
+	buffer.writeu16(out, 8, height)
+	buffer.writeu32(out, 10, frames)
+	buffer.writeu16(out, 14, keyEvery)
+	buffer.writeu16(out, 16, #chunks)
+	writeu8(out, 18, layers)
+	local off = 0
+	for i, c in ipairs(chunks) do
+		local d = HEADER + (i - 1) * DIR_ENTRY
+		buffer.writeu32(out, d, off)
+		buffer.writeu32(out, d + 4, buffer.len(c.a))
+		buffer.writeu32(out, d + 8, buffer.len(c.b))
+		buffer.writeu32(out, d + 12, c.first)
+		buffer.copy(out, HEADER + dirSize + off, c.a, 0)
+		buffer.copy(out, HEADER + dirSize + off + buffer.len(c.a), c.b, 0)
+		off += buffer.len(c.a) + buffer.len(c.b)
+	end
+	stats.frames = frames
+	stats.bytes = buffer.len(out)
+	stats.seconds = frames / fps
+	stats.bytesPerSecond = stats.bytes / math.max(stats.seconds, 1e-9)
+	stats.codec = "FLV2"
+	return out, stats
 end
 
 return Flv2

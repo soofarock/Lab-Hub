@@ -17,6 +17,21 @@ local DEFAULTS = {
 	-- synced screens (TVs and any tagged "FrameLab" screen)
 	ViewDistance = 120, -- clients play a screen only within this distance
 	MaxPlaying = 2, -- most screens a client plays at once (the nearest)
+	-- video a client keeps in memory, all its screens together (MB): the part ahead of the playhead streams in while
+	-- it plays, and what has played is dropped first
+	VideoCacheMB = 6,
+	-- the size a client plays when a video was imported at two sizes (360p imports keep a 180p copy, 240p a 144p one):
+	-- "auto" (the smaller one: redrawing the larger one's GUI objects keeps the game's frames long), "high" (the larger
+	-- one; a client whose screen falls behind still steps down) or "low"
+	VideoRendition = "auto",
+	-- streams (HLS addresses): "auto" (each client decodes the H.264 itself on worker threads, and goes back to the
+	-- server's converted copy if it falls behind), "client" or "server" (always the converted copy)
+	VideoDecode = "auto",
+	-- a jump on a playing TV: its playhead waits at the new spot until the picture is there, at most this long (seconds)
+	SeekHold = 8,
+	-- stream mode (the TV's Stream switch): the tallest MP4 / MOV / WebM it streams (lines on the short side; the server
+	-- converts it as it plays, and computers decode it themselves). A taller one is imported whole instead, shrunk to fit
+	StreamMaxSourceLines = 400,
 	ControlPerSecond = 8, -- client control requests per player per second
 
 	-- TV tool
@@ -55,7 +70,14 @@ local DEFAULTS = {
 	-- in-game imports (admins: Import in the TV picker and in Spray Paint; kept while the server runs)
 	ImportMaxBytes = 26214400, -- largest file downloaded (25 MB)
 	ImportMaxSeconds = 300, -- longest video kept (and what the YouTube helper downloads)
-	ImportMaxVideoLines = 480, -- MP4 videos up to this many lines (480 = 480p: 854x480 or 480x854); bigger ones are slow
+	-- MP4 / MOV sources up to this many lines (1080 = 1080p), shrunk to ImportVideoQuality as they are read; a 1080p
+	-- source takes several times longer to import than a 360p one
+	ImportMaxVideoLines = 1080,
+	-- in a running game an MP4 / MOV import is split over this many parallel workers (Actors), each encoding a part
+	ImportWorkers = 4,
+	-- an HLS address (.m3u8) imported in game plays as a stream: the server converts only the parts being watched, up
+	-- to this many seconds of it
+	StreamMaxSeconds = 7200,
 	-- the size imported videos are kept at: "144p" (256x144, 60 KB/s: light enough for phones) or "240p" (426x240,
 	-- 120 KB/s: sharper, about 3x the drawing and data). Admins can also pick it per import in the TV picker.
 	ImportVideoQuality = "144p",

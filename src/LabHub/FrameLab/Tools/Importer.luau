@@ -1,8 +1,17 @@
 -- FrameLab importer (Studio). Opens the file picker and turns every chosen file into FrameLab data:
---   pictures  PNG, JPG / JPEG / JFIF, BMP, TGA, WebP, GIF (one frame)   -> Data/Images/<name>
---   video     MP4 / MOV / M4V (H.264; up to Config.ImportMaxVideoLines, 480p by default), AVI (Motion JPEG or
---             uncompressed; PCM sound), animated GIF or WebP -> Data/Videos/<name>
---             the sound (MP4: AAC or MP3; AVI: PCM) becomes an AudioLab clip (clip:video/<name>) that the video follows;
+--   pictures  PNG, JPG / JPEG / JFIF, BMP, TGA, WebP, GIF (one frame), HEIC / HEIF (iPhone photos), AVIF
+--             -> Data/Images/<name>
+--   video     MP4 / MOV / M4V (H.264, H.265, AV1 or MPEG-4 Part 2), WebM (VP9, VP8 or AV1), MKV (VP9, VP8, AV1, H.264,
+--             H.265 or MPEG-4 Part 2), AVI / DivX
+--             (MPEG-4 Part 2: Xvid, DivX; Motion JPEG or uncompressed), MPEG-1 / MPEG-2 (.mpg / .mpeg / .vob, .m1v / .m2v) and
+--             transport streams (.ts / .m2ts / .mts: MPEG-2, H.264 or H.265); sources up to Config.ImportMaxVideoLines, 1080p by
+--             default, shrunk to the import quality; animated GIF, WebP or PNG (APNG) -> Data/Videos/<name>
+--             360p and 240p imports keep a smaller copy too (180p / 144p, one entry: Flv2.packSet), so a device that
+--             can't keep up with the big one plays the small one (Video.Stream.deviceLines). In a running game an MP4 /
+--             MOV is encoded in parts on Config.ImportWorkers parallel workers (Tools.ImportPool), and its sound is
+--             encoded meanwhile
+--             the sound (MP4 / MOV: AAC, MP3, Opus, FLAC or AC-3; WebM / MKV: Opus, Vorbis, AAC, MP3, FLAC or AC-3; MPEG: MP2 /
+--             MP3, AC-3, AAC or 16-bit PCM; AVI: PCM, MP3, MP2 or AC-3) becomes an AudioLab clip (clip:video/<name>) that the video follows;
 --             in-game imports (options.Sink) keep it too, for the server's session
 --
 --   FrameLab.import(options)            -- run from the command bar (needs plugin access for the picker)
@@ -29,28 +38,39 @@ local Tga = require(FrameLab.Formats.Tga)
 local Gif = require(FrameLab.Formats.Gif)
 local Avi = require(FrameLab.Formats.Avi)
 local Webp = require(FrameLab.Formats.Webp)
+local Heif = require(FrameLab.Formats.Heif)
 local Mp4 = require(FrameLab.Formats.Mp4)
+local Webm = require(FrameLab.Formats.Webm)
+local Mpg = require(FrameLab.Formats.Mpg)
+local Mpeg4 = require(FrameLab.Video.Mpeg4)
+local Vp9 = require(FrameLab.Video.Vp9)
+local Vp8 = require(FrameLab.Video.Vp8)
 local H264 = require(FrameLab.Video.H264)
+local Hevc = require(FrameLab.Video.Hevc)
+local Av1 = require(FrameLab.Video.Av1)
 local Config = require(game:GetService("ReplicatedStorage"):WaitForChild("LabHub"):WaitForChild("Config"))
 local Resize = require(FrameLab.Image.Resize)
 local Stream = require(FrameLab.Video.Stream)
 local Flv2 = require(FrameLab.Video.Flv2)
+local ImportJob = require(FrameLab.Tools.ImportJob)
+local ImportPool = require(FrameLab.Tools.ImportPool)
 
 local EncodingService = game:GetService("EncodingService")
 
 local Importer = {}
 
-Importer.Extensions = { "png", "jpg", "jpeg", "jfif", "jpe", "bmp", "dib", "tga", "gif", "webp", "avi", "mp4", "m4v", "mov" }
-Importer.Readable = "PNG, JPG, BMP, TGA, GIF, WebP pictures; MP4 (H.264), GIF, WebP, AVI videos"
+Importer.Extensions = { "png", "jpg", "jpeg", "jfif", "jpe", "bmp", "dib", "tga", "gif", "webp", "heic", "heif", "avif", "avi", "divx", "mp4", "m4v", "mov", "webm", "mkv", "mpg", "mpeg", "m1v", "m2v", "vob", "ts", "m2ts", "mts" }
+Importer.Readable = "PNG, JPG, BMP, TGA, GIF, WebP, HEIC, AVIF pictures; MP4 / MOV (H.264, H.265, AV1, MPEG-4), WebM (VP9 / VP8 / AV1), MKV (VP9 / VP8 / AV1 / H.264 / H.265 / MPEG-4), AVI (Xvid / DivX, Motion JPEG), MPEG-1 / MPEG-2 (.mpg, .vob, .ts), GIF, WebP, APNG videos"
 Importer.Defaults = { MaxImage = 512, MaxVideoWidth = 256, MaxVideoHeight = 256, Fps = 24, MaxSeconds = 600, ChangeTol = 8,
 	TargetKBps = 60, Codec = "FLV2" }
 local HARD_MAX = 1024
 
--- video sizes: the short side gets `lines` pixels, the long side at most 16:9 of that (256x144, 426x240; 4:3 -> 192x144)
+-- video sizes: the short side gets `lines` pixels, the long side at most 16:9 of that (256x144, 426x240; 4:3 -> 192x144);
+-- low: the smaller copy kept alongside for slower devices
 Importer.Qualities = {
 	["144p"] = { lines = 144, kbps = 60 },
-	["240p"] = { lines = 240, kbps = 120 },
-	["360p"] = { lines = 360, kbps = 200 }, -- 640x360: ~2.3x the drawing and data of 240p (PCs)
+	["240p"] = { lines = 240, kbps = 120, low = { lines = 144, kbps = 40 } },
+	["360p"] = { lines = 360, kbps = 200, low = { lines = 180, kbps = 48 } }, -- 640x360: ~2.3x the drawing and data of 240p
 }
 function Importer.quality(name)
 	name = name or Config.ImportVideoQuality or "144p"
@@ -140,11 +160,17 @@ local function kindOf(bytes, fileName)
 		return "avi"
 	elseif Webp.isWebp(bytes) then
 		return "webp"
+	elseif Webm.isWebm(bytes) then
+		return "webm"
+	elseif Heif.isHeif(bytes) then
+		return "heif"
 	elseif Mp4.isMp4(bytes) then
 		local brand = buffer.len(bytes) >= 12 and buffer.readstring(bytes, 8, 4) or ""
 		if brand ~= "avif" and brand ~= "avis" and brand ~= "heic" and brand ~= "heix" and brand ~= "mif1" and brand ~= "msf1" then
 			return "mp4"
 		end
+	elseif Mpg.isMpg(bytes) then
+		return "mpg"
 	elseif Bmp.isBmp(bytes) then
 		return "bmp"
 	elseif string.lower(string.match(fileName, "%.(%w+)$") or "") == "tga" and Tga.isTga(bytes) then
@@ -164,15 +190,13 @@ local function sniff(b)
 	if n >= 12 and string.sub(head, 5, 8) == "ftyp" then
 		local brand = string.sub(head, 9, 12)
 		if brand == "avif" or brand == "avis" then
-			return "an AVIF picture (not supported yet: save it as PNG or JPG)"
+			return "an AVIF picture of a kind FrameLab can't read (save it as PNG or JPG)"
 		elseif brand == "heic" or brand == "heix" or brand == "mif1" or brand == "msf1" then
-			return "a HEIC / HEIF picture (iPhone photo format, not supported: save it as JPG or PNG)"
-		elseif brand == "qt  " then
-			return "a QuickTime MOV video (not supported yet)"
+			return "a HEIC / HEIF picture of a kind FrameLab can't read (save it as JPG or PNG)"
 		end
-		return ("an MP4 video (brand %q; MP4 import is coming)"):format(brand)
+		return ("an MP4-family file (brand %q)"):format(brand)
 	elseif string.sub(head, 1, 4) == "\26\69\223\163" then
-		return string.find(head, "webm", 1, true) and "a WebM video (WebM import is coming)" or "a Matroska (MKV) video (not supported)"
+		return string.find(head, "webm", 1, true) and "a WebM video" or "a Matroska (MKV) video"
 	elseif string.sub(head, 1, 4) == "RIFF" and string.sub(head, 9, 12) == "WAVE" then
 		return "a WAV sound (import sounds with AudioLab)"
 	elseif string.sub(head, 1, 3) == "ID3" or (n > 1 and buffer.readu8(b, 0) == 0xff and bit32.band(buffer.readu8(b, 1), 0xe0) == 0xe0) then
@@ -229,93 +253,6 @@ local function decode(fileName, fn, ...)
 end
 Importer.cleanError = cleanError
 
--- a decoded H.264 picture (YUV 4:2:0) -> RGBA at w x h (box filter: each output pixel averages its source area)
-local function yuvToImage(dec, pic, w, h)
-	local W, Hh = dec.width, dec.height
-	local cx, cy = dec.cropX or 0, dec.cropY or 0
-	local Yp, Up, Vp, ys, cs, yo, co = pic.Y, pic.U, pic.V, pic.ys, pic.cs, pic.yo, pic.co
-	local out = buffer.create(w * h * 4)
-	-- colour matrix (BT.709 for HD, BT.601 otherwise, unless the stream says), limited or full range
-	local kr, kb = 0.299, 0.114
-	if dec.bt709 then
-		kr, kb = 0.2126, 0.0722
-	end
-	local kg = 1 - kr - kb
-	local ys0, yscale, cscale = 16, 255 / 219, 255 / 224
-	if dec.fullRange then
-		ys0, yscale, cscale = 0, 1, 1
-	end
-	local rv = 2 * (1 - kr) * cscale
-	local bu = 2 * (1 - kb) * cscale
-	local gu = 2 * (1 - kb) * kb / kg * cscale
-	local gv = 2 * (1 - kr) * kr / kg * cscale
-	local readu8, writeu8 = buffer.readu8, buffer.writeu8
-	local x0s, x1s = table.create(w, 0), table.create(w, 0)
-	for ox = 0, w - 1 do
-		local x0 = ox * W // w
-		x0s[ox + 1] = x0
-		x1s[ox + 1] = math.max(x0 + 1, (ox + 1) * W // w)
-	end
-	for oy = 0, h - 1 do
-		local y0 = oy * Hh // h
-		local y1 = math.max(y0 + 1, (oy + 1) * Hh // h)
-		for ox = 0, w - 1 do
-			local x0, x1 = x0s[ox + 1], x1s[ox + 1]
-			local sy, n = 0, 0
-			for yy = y0, y1 - 1 do
-				local row = yo + (yy + cy) * ys + cx
-				for xx = x0, x1 - 1 do
-					sy += readu8(Yp, row + xx)
-				end
-				n += x1 - x0
-			end
-			local su, sv, m = 0, 0, 0
-			for yy = (y0 + cy) // 2, (y1 - 1 + cy) // 2 do
-				local row = co + yy * cs
-				for xx = (x0 + cx) // 2, (x1 - 1 + cx) // 2 do
-					su += readu8(Up, row + xx)
-					sv += readu8(Vp, row + xx)
-					m += 1
-				end
-			end
-			local Y = (sy / n - ys0) * yscale
-			local U = su / m - 128
-			local V = sv / m - 128
-			local r = Y + rv * V
-			local g = Y - gu * U - gv * V
-			local b = Y + bu * U
-			local o = (oy * w + ox) * 4
-			writeu8(out, o, math.clamp(math.floor(r + 0.5), 0, 255))
-			writeu8(out, o + 1, math.clamp(math.floor(g + 0.5), 0, 255))
-			writeu8(out, o + 2, math.clamp(math.floor(b + 0.5), 0, 255))
-			writeu8(out, o + 3, 255)
-		end
-	end
-	return { width = w, height = h, data = out, hasAlpha = false }
-end
-
--- is this MP4 sample a picture other pictures predict from? (nal_ref_idc of its first slice)
-local function isReferenceSample(buf, pos, size, nalLength)
-	local stop = pos + size
-	while pos + nalLength < stop do
-		local n = 0
-		for k = 0, nalLength - 1 do
-			n = n * 256 + buffer.readu8(buf, pos + k)
-		end
-		pos += nalLength
-		if n <= 0 or pos >= stop then
-			break
-		end
-		local hdr = buffer.readu8(buf, pos)
-		local t = bit32.band(hdr, 31)
-		if t == 1 or t == 5 then
-			return bit32.band(hdr, 0x60) ~= 0
-		end
-		pos += n
-	end
-	return true
-end
-
 -- a video's sound -> AudioLab clip "video/<name>". decode(AudioLab) -> { signal } | signal. Returns attrs.Audio (or nil)
 -- and a note for the message. In-game imports (o.Sink) keep the clip in the server's memory (o.Sink("Sounds", ...)):
 -- nothing replicates; a client fetches it from the server when a TV plays it (FrameLab.Net.clip).
@@ -371,14 +308,16 @@ local function storeImage(name, image, o, sourceKind)
 	local w, h = fitSize(image.width, image.height, o.MaxImage, o.MaxImage)
 	local small = Resize.to(image, w, h, true)
 	local bytes = Importer.packImage(small)
-	local attrs = { Width = w, Height = h, SourceWidth = image.width, SourceHeight = image.height, Source = sourceKind }
+	-- (a picture decoded at a reduced size names the size it came from)
+	local srcW, srcH = image.sourceWidth or image.width, image.sourceHeight or image.height
+	local attrs = { Width = w, Height = h, SourceWidth = srcW, SourceHeight = srcH, Source = sourceKind }
 	if o.Sink then
 		o.Sink("Images", name, bytes, attrs)
 	else
 		Store.write(FrameLab.Data.Images, name, bytes, attrs)
 	end
 	return { kind = "image", name = name, width = w, height = h, bytes = buffer.len(bytes),
-		message = ("picture %s: %dx%d (from %dx%d), %.0f KB"):format(name, w, h, image.width, image.height, buffer.len(bytes) / 1024) }
+		message = ("picture %s: %dx%d (from %dx%d), %.0f KB"):format(name, w, h, srcW, srcH, buffer.len(bytes) / 1024) }
 end
 
 -- the stored size of a srcW x srcH video
@@ -393,54 +332,118 @@ local function videoSize(srcW, srcH, o)
 	return fitSize(srcW, srcH, o.MaxVideoWidth, o.MaxVideoHeight)
 end
 
+-- the sizes a video is kept at: the import quality, and the quality's smaller copy (FLV2 only)
+local function videoSizes(srcW, srcH, o)
+	local w, h = videoSize(srcW, srcH, o)
+	local list = { { w = w, h = h, kbps = o.TargetKBps } }
+	local q = o.VideoLines and Importer.Qualities[o.Quality]
+	local low = q and q.low
+	if low and o.Renditions ~= false and o.Codec ~= "FLV1" then
+		local lw, lh = videoSize(srcW, srcH, { VideoLines = low.lines })
+		if lw < w or lh < h then
+			table.insert(list, { w = lw, h = lh, kbps = low.kbps })
+		end
+	end
+	return list
+end
+
+-- the sizes kept for a srcW x srcH source at import quality `quality` (also for streams: Tools.Live)
+function Importer.videoSizes(srcW, srcH, quality)
+	return videoSizes(srcW, srcH, opts({ Quality = quality }))
+end
+
+-- one writer per size, fed by produce(add): add(images) with one image per size, in frame order
+local function encodeSizes(sizes, fps, produce, o)
+	local writers = {}
+	for i, sz in ipairs(sizes) do
+		if o.Codec == "FLV1" then
+			writers[i] = Stream.writer(sz.w, sz.h, fps, { ChangeTol = o.ChangeTol, Compress = zstd })
+		else
+			writers[i] = Flv2.writer(sz.w, sz.h, fps, { TargetKBps = sz.kbps, Layers = o.Layers })
+		end
+	end
+	produce(function(imgs)
+		for i, w in ipairs(writers) do
+			w:add(imgs[i])
+		end
+	end)
+	local results = {}
+	for i, w in ipairs(writers) do
+		local bytes, st = w:finish()
+		results[i] = { bytes = bytes, stats = st }
+	end
+	return results
+end
+
+-- the entry's bytes (several sizes: one FLVS set) and the main size's stats (bytes: the whole entry)
+local function finishVideo(results, sizes)
+	local bytes = results[1].bytes
+	if #sizes > 1 then
+		local list = {}
+		for i, sz in ipairs(sizes) do
+			list[i] = { bytes = results[i].bytes, width = sz.w, height = sz.h, bytesPerSecond = results[i].stats.bytesPerSecond }
+		end
+		bytes = Flv2.packSet(list)
+	end
+	local st = results[1].stats
+	st.bytes = buffer.len(bytes)
+	return bytes, st
+end
+
+local function sizesNote(sizes)
+	if #sizes < 2 then
+		return ""
+	end
+	return (", with a %dx%d copy for slower devices"):format(sizes[2].w, sizes[2].h)
+end
+
 -- video from a frame source: getFrame(i) -> image or nil (repeat), times: output frame k -> source index
 local function storeVideo(name, srcW, srcH, outFps, frameCount, sourceIndex, getFrame, o, log)
-	local w, h = videoSize(srcW, srcH, o)
-	local writer
-	if o.Codec == "FLV1" then
-		writer = Stream.writer(w, h, outFps, { ChangeTol = o.ChangeTol, Compress = zstd })
-	else
-		writer = Flv2.writer(w, h, outFps, { TargetKBps = o.TargetKBps, Layers = o.Layers })
-	end
-	local cache, cacheIndex, last = nil, -1, nil
+	local sizes = videoSizes(srcW, srcH, o)
 	local t0 = os.clock()
-	local lastYield = os.clock()
-	local progress = o.Progress
-	for k = 0, frameCount - 1 do
-		local si = sourceIndex(k)
-		if si ~= cacheIndex then
-			local img = getFrame(si)
-			if img then
-				if img.hasAlpha then
-					img = Resize.flatten(img, 0, 0, 0)
+	local results = encodeSizes(sizes, outFps, function(add)
+		local cache, cacheIndex, last = nil, -1, nil
+		local lastYield = os.clock()
+		local progress = o.Progress
+		for k = 0, frameCount - 1 do
+			local si = sourceIndex(k)
+			if si ~= cacheIndex then
+				local img = getFrame(si)
+				if img then
+					if img.hasAlpha then
+						img = Resize.flatten(img, 0, 0, 0)
+					end
+					cache = {}
+					for i, sz in ipairs(sizes) do
+						cache[i] = Resize.to(img, sz.w, sz.h)
+					end
 				end
-				cache = Resize.to(img, w, h)
+				cacheIndex = si
 			end
-			cacheIndex = si
-		end
-		cache = cache or last
-		if cache then
-			writer:add(cache)
-			last = cache
-		end
-		-- (a pause after ~12 ms of work, not after every frame: a wait per frame cost a whole server frame each time,
-		-- ~12 s of waiting for a 30 s video)
-		if os.clock() - lastYield > 0.012 then
-			task.wait()
-			lastYield = os.clock()
-			if progress then
-				progress("video", (k + 1) / frameCount)
+			cache = cache or last
+			if cache then
+				add(cache)
+				last = cache
+			end
+			-- (a pause after ~12 ms of work, not after every frame: a wait per frame cost a whole server frame each time,
+			-- ~12 s of waiting for a 30 s video)
+			if os.clock() - lastYield > 0.012 then
+				task.wait()
+				lastYield = os.clock()
+				if progress then
+					progress("video", (k + 1) / frameCount)
+				end
+			end
+			if log and k % 48 == 47 then
+				log(("  %s: %d / %d frames (%.0f s)"):format(name, k + 1, frameCount, os.clock() - t0))
 			end
 		end
-		if log and k % 48 == 47 then
-			log(("  %s: %d / %d frames (%.0f s)"):format(name, k + 1, frameCount, os.clock() - t0))
-		end
-	end
-	local bytes, stats = writer:finish()
+	end, o)
+	local bytes, stats = finishVideo(results, sizes)
 	if o.Timing then
 		o.Timing.video = os.clock() - t0
 	end
-	return bytes, stats, w, h
+	return bytes, stats, sizes[1].w, sizes[1].h, sizes
 end
 
 function Importer.importFile(fileName, bytes, options)
@@ -461,7 +464,14 @@ function Importer.importFile(fileName, bytes, options)
 	if not kind then
 		error(("%s is %s. FrameLab reads %s."):format(fileName, sniff(buf), Importer.Readable), 0)
 	end
-	if kind == "png" then
+	local avi
+	if kind == "avi" then
+		avi = decode(fileName, Avi.parse, buf)
+		if avi.video then
+			kind = "avi4" -- (MPEG-4 video: read like an MP4's track)
+		end
+	end
+	if kind == "png" and not Png.isAnimated(buf) then
 		return storeImage(name, decode(fileName, Png.decode, buf, { Yield = true }), o, "PNG")
 	elseif kind == "jpeg" then
 		return storeImage(name, decode(fileName, Jpeg.decode, buf, { MaxSize = o.MaxImage, Yield = true }), o, "JPEG")
@@ -469,17 +479,22 @@ function Importer.importFile(fileName, bytes, options)
 		return storeImage(name, decode(fileName, Bmp.decode, buf), o, "BMP")
 	elseif kind == "tga" then
 		return storeImage(name, decode(fileName, Tga.decode, buf), o, "TGA")
-	elseif kind == "gif" or kind == "webp" then
+	elseif kind == "heif" then
+		local label = ({ heic = "HEIC", avif = "AVIF" })[Heif.brand(buf)] or "HEIF"
+		return storeImage(name, decode(fileName, Heif.decode, buf, { MaxSize = math.min(o.MaxImage, HARD_MAX), Yield = true }), o, label)
+	elseif kind == "gif" or kind == "webp" or kind == "png" then
 		local g
 		if kind == "gif" then
 			g = decode(fileName, Gif.decode, buf)
+		elseif kind == "png" then
+			g = decode(fileName, Png.decodeAnimation, buf, { Yield = true })
 		else
 			g = decode(fileName, Webp.decode, buf)
 			if not g.frames then
 				return storeImage(name, g, o, "WebP")
 			end
 		end
-		local label = kind == "gif" and "GIF" or "WebP"
+		local label = kind == "gif" and "GIF" or (kind == "png" and "APNG" or "WebP")
 		if #g.frames == 1 then
 			return storeImage(name, { width = g.width, height = g.height, data = g.frames[1].data, hasAlpha = g.hasAlpha }, o, label)
 		end
@@ -513,140 +528,233 @@ function Importer.importFile(fileName, bytes, options)
 		end
 		return { kind = "video", name = name, width = w, height = h, seconds = st.seconds, bytes = st.bytes,
 			message = ("video %s: %dx%d, %.1f s at %d fps (animated %s, %d frames), %.0f KB (%.0f KB/s)"):format(name, w, h, st.seconds, fps, label, #g.frames, st.bytes / 1024, st.bytesPerSecond / 1024) }
-	elseif kind == "mp4" then
-		local m = decode(fileName, Mp4.parse, buf)
+	elseif kind == "mp4" or kind == "webm" or kind == "mpg" or kind == "avi4" then
+		local webm = kind == "webm"
+		local mpg = kind == "mpg"
+		local m
+		if avi then
+			-- (PCM sound: as the WAV file it is)
+			m = { container = "AVI", video = avi.video, audio = avi.track or (avi.audio and { codec = "PCM", wav = true }) }
+		else
+			m = decode(fileName, mpg and Mpg.parse or (webm and Webm.parse or Mp4.parse), buf)
+		end
+		local container = (mpg or avi) and m.container or (webm and "WebM" or "MP4")
 		local v = m.video
-		if not v then
-			error(("%s is a sound file (M4A), not a video: import it with AudioLab"):format(fileName), 0)
+		if not v and mpg then
+			if m.otherVideo then
+				error(("%s is an MPEG stream with %s video, which FrameLab can't read: re-save it as H.264 (\"MP4 / H.264\" in most converters)"):format(
+					fileName, m.otherVideo), 0)
+			end
+			error(("%s has no video FrameLab can read (MPEG-1 / MPEG-2, H.264 or H.265)"):format(fileName), 0)
+		elseif not v then
+			error(("%s is a sound file (%s), not a video: import it with AudioLab"):format(fileName, webm and "WebM / MKV" or "M4A"), 0)
 		end
 		local codec = v.codec or "?"
-		if codec ~= "avc1" and codec ~= "avc3" then
-			local names = { hvc1 = "H.265 (HEVC)", hev1 = "H.265 (HEVC)", av01 = "AV1", vp09 = "VP9", vp08 = "VP8", mp4v = "MPEG-4 Part 2", s263 = "H.263" }
-			error(("%s is an MP4 with %s video, which FrameLab can't read: re-save it as H.264 (\"MP4 / H.264\" in most converters)"):format(fileName, names[codec] or ("%q"):format(codec)), 0)
+		local isVp8 = codec == "vp08"
+		local isVp9 = codec == "vp09" or isVp8 -- (VP9 and VP8 are read alike here)
+		local isMpeg = codec == "mpgv"
+		local isMp4v = codec == "mp4v"
+		local isHevc = codec == "hvc1" or codec == "hev1"
+		local isAv1 = codec == "av01"
+		if codec ~= "avc1" and codec ~= "avc3" and not isVp9 and not isMpeg and not isMp4v and not isHevc and not isAv1 then
+			local names = { m2v1 = "MPEG-2", s263 = "H.263", theora = "Theora" }
+			error(("%s is %s with %s video, which FrameLab can't read: re-save it as H.264 (\"MP4 / H.264\" in most converters) or as VP9 / VP8 WebM"):format(
+				fileName, webm and "a WebM / MKV" or "an MP4", names[codec] or ("%q"):format(codec)), 0)
 		end
-		if not v.avcC then
-			error(fileName .. " couldn't be read: MP4: the H.264 setup (avcC) is missing", 0)
-		end
-		local dec = decode(fileName, H264.new, v.avcC)
+		local codecName = isMpeg and (v.mpeg2 and "MPEG-2" or "MPEG-1") or isMp4v and "MPEG-4" or isHevc and "H.265" or isAv1 and "AV1" or isVp8 and "VP8" or isVp9 and "VP9" or "H.264"
+		local srcW, srcH = v.width or 0, v.height or 0 -- (MPEG: from the sequence header, in the picture's shape)
 		local sps0
-		for _, s in pairs(dec.spsList) do
-			sps0 = s
-			break
-		end
-		local srcW, srcH = v.width or 0, v.height or 0
-		if sps0 then
-			srcW = sps0.mbw * 16 - sps0.cropLeft - sps0.cropRight
-			srcH = sps0.mbh * 16 - sps0.cropTop - sps0.cropBottom
+		if v.annexB then
+			-- (H.264 / H.265 from a transport stream: the size from its first pictures)
+			local probe = isHevc and Hevc.new(nil) or H264.new(nil)
+			for i = 1, math.min(#v.samples, 30) do
+				local s = v.samples[i]
+				if pcall(probe.decodeAccessUnit, probe, v.data, s.pos, s.size) and probe.width then
+					srcW, srcH = probe.width, probe.height
+					break
+				end
+			end
+		elseif isVp9 then
+			-- (the picture size from the first frame: the track may give a display size)
+			local first = v.samples[1]
+			local probe = isVp8 and Vp8.new() or Vp9.new()
+			local okProbe, err = pcall(probe.decodeSample, probe, buf, first.pos, first.size)
+			if not okProbe then
+				error(("%s couldn't be read: %s"):format(fileName, cleanError(err)), 0)
+			end
+			if probe.width > 0 then
+				srcW, srcH = probe.width, probe.height
+			end
+		elseif isMp4v then
+			-- (the picture size and pixel shape from the VOL headers: the setup, or the first frame)
+			local probe = Mpeg4.parser(v.config)
+			local st = probe.st
+			if (st.width or 0) == 0 and v.samples[1] then
+				pcall(probe.vops, probe, v.data or buf, v.samples[1].pos, v.samples[1].size)
+			end
+			if (st.width or 0) > 0 then
+				srcW, srcH = st.width, st.height
+				if st.parW > 0 and st.parH > 0 and st.parW ~= st.parH then
+					srcW = math.max(1, math.floor(st.width * st.parW / st.parH + 0.5))
+				end
+			end
+		elseif isAv1 then
+			-- (the picture size from the sequence header: the setup's, or the first frame's)
+			local probe
+			if v.av1C then
+				probe = decode(fileName, Av1.new, v.av1C)
+			end
+			if not probe or (probe.width or 0) <= 0 then
+				local first = v.samples[1]
+				probe = Av1.new(nil)
+				local okProbe, err = pcall(probe.decodeSample, probe, v.data or buf, first.pos, first.size)
+				if not okProbe then
+					error(("%s couldn't be read: %s"):format(fileName, cleanError(err)), 0)
+				end
+			end
+			if (probe.width or 0) > 0 then
+				srcW, srcH = probe.width, probe.height
+			end
+		elseif isHevc then
+			-- (the picture size and pixel shape from the setup's sequence parameters)
+			if not v.hvcC then
+				error(("%s couldn't be read: %s: the H.265 setup (hvcC) is missing"):format(fileName, container), 0)
+			end
+			local probe = decode(fileName, Hevc.new, v.hvcC)
+			if probe.width then
+				srcW, srcH = probe.width, probe.height
+				if probe.sarW > 0 and probe.sarH > 0 and probe.sarW ~= probe.sarH then
+					srcW = math.max(1, math.floor(probe.width * probe.sarW / probe.sarH + 0.5))
+				end
+			end
+		elseif not isMpeg then
+			if not v.avcC then
+				error(("%s couldn't be read: %s: the H.264 setup (avcC) is missing"):format(fileName, container), 0)
+			end
+			local dec = decode(fileName, H264.new, v.avcC)
+			for _, s in pairs(dec.spsList) do
+				sps0 = s
+				break
+			end
+			if sps0 then
+				srcW = sps0.mbw * 16 - sps0.cropLeft - sps0.cropRight
+				srcH = sps0.mbh * 16 - sps0.cropTop - sps0.cropBottom
+			end
 		end
 		if srcW <= 0 or srcH <= 0 then
-			error(fileName .. " couldn't be read: MP4: the video has no size", 0)
+			error(("%s couldn't be read: %s: the video has no size"):format(fileName, container), 0)
 		end
-		local maxLines = o.MaxVideoLines or Config.ImportMaxVideoLines or 480
+		local maxLines = o.MaxVideoLines or Config.ImportMaxVideoLines or 1080
 		if math.min(srcW, srcH) > maxLines then
 			error(("%s is %dx%d (%dp); the limit is %dp (ImportMaxVideoLines). Use a %dp copy, or raise the limit (bigger videos take much longer to import)"):format(
 				fileName, srcW, srcH, math.min(srcW, srcH), maxLines, maxLines), 0)
 		end
-		local samples = v.samples
-		local n = #samples
-		local order = table.create(n, 0)
-		for i = 1, n do
-			order[i] = i
-		end
-		table.sort(order, function(a, b)
-			return samples[a].pts < samples[b].pts
-		end)
-		local disp, dispPts = table.create(n, 0), table.create(n, 0)
-		for k, i in ipairs(order) do
-			disp[i] = k
-			dispPts[k] = samples[i].pts
-		end
-		local duration = v.duration
-		local last = dispPts[n]
-		if n > 1 then
-			local frameDur = (last - dispPts[1]) / (n - 1)
-			if duration <= 0 or duration < last then
-				duration = last + frameDur
-			end
-		elseif duration <= 0 then
-			duration = 1 / 24
-		end
-		local srcFps = n / duration
-		local fps = math.max(1, math.floor(math.min(o.Fps, srcFps) + 0.5))
-		local seconds = math.min(duration, o.MaxSeconds)
-		local count = math.max(1, math.floor(seconds * fps + 1e-6))
-		local j = 1
-		local function sourceIndex(k)
-			local t = k / fps
-			while j < n and dispPts[j + 1] <= t + 1e-6 do
-				j += 1
-			end
-			return j
-		end
-		local needed = {}
-		for k = 0, count - 1 do
-			needed[sourceIndex(k)] = true
-		end
-		j = 1
-		local pocType0 = true
-		for _, s in pairs(dec.spsList) do
-			if s.pocType ~= 0 then
-				pocType0 = false
-			end
-		end
-		local w, h = videoSize(srcW, srcH, o)
-		local cache = {}
-		local nextSample = 1
-		local lastNeeded = 0
-		for k in pairs(needed) do
-			lastNeeded = math.max(lastNeeded, k)
-		end
-		local function getFrame(si)
-			while not cache[si] and nextSample <= n do
-				local s = samples[nextSample]
-				local di = disp[nextSample]
-				local idx = nextSample
-				nextSample += 1
-				if s.cut then
-					error(("%s is cut off: frame %d of %d is missing (the download stopped early)"):format(fileName, idx, n), 0)
-				end
-				if needed[di] or not pocType0 or isReferenceSample(buf, s.pos, s.size, dec.nalLength) then
-					local ok, pic = pcall(dec.decodeSample, dec, buf, s.pos, s.size)
-					if not ok then
-						error(("%s couldn't be read: %s (frame %d of %d)"):format(fileName, cleanError(pic), idx, n), 0)
-					end
-					if pic and needed[di] then
-						cache[di] = yuvToImage(dec, pic, w, h)
-					end
-				end
-			end
-			local img = cache[si]
-			for k in pairs(cache) do
-				if k < si then
-					cache[k] = nil
-				end
-			end
-			return img
-		end
-		log(("%s: %dx%d H.264 (profile %d) video, %.2f fps, %d frames, %.1f s%s"):format(fileName, srcW, srcH, sps0 and sps0.profile or 0, srcFps, n, duration,
+		local t = ImportJob.mp4Timing(v, o.Fps, o.MaxSeconds)
+		local fps, seconds, count = t.fps, t.seconds, t.count
+		local sizes = videoSizes(srcW, srcH, o)
+		local ow, oh = sizes[1].w, sizes[1].h
+		log(("%s: %dx%d %s video, %.2f fps, %d frames, %.1f s%s"):format(fileName, srcW, srcH,
+			codecName .. (sps0 and (" (profile " .. sps0.profile .. ")") or ""), t.srcFps, t.n, t.duration,
 			m.audio and (", sound " .. tostring(m.audio.codec)) or ", no sound"))
-		local streamBytes, st, ow, oh = storeVideo(name, srcW, srcH, fps, count, sourceIndex, getFrame, o, log)
-		local attrs = { Width = ow, Height = oh, Fps = fps, Frames = st.frames, Seconds = st.seconds, Source = "MP4 H.264", Quality = o.Quality }
+		local attrs = { Width = ow, Height = oh, Fps = fps, Source = container .. " " .. codecName, Quality = o.Quality }
 		local audioNote = ""
-		if m.audio and o.Sound ~= false then
-			attrs.Audio, audioNote = storeSound(name, seconds, function(AudioLab)
-				return AudioLab.Encoder.decodeMp4Audio(buf, m.audio, { MaxSeconds = seconds + 0.5 })
-			end, log, o)
+		local soundDone = not (m.audio and o.Sound ~= false)
+		local function sound(so)
+			if not soundDone then
+				soundDone = true
+				attrs.Audio, audioNote = storeSound(name, seconds, function(AudioLab)
+					if m.audio.wav then
+						return AudioLab.Encoder.decodeAudio(Avi.wav(avi), { MaxSeconds = seconds + 0.5 })
+					end
+					return AudioLab.Encoder.decodeMp4Audio(buf, m.audio, { MaxSeconds = seconds + 0.5 })
+				end, log, so)
+			end
 		end
+		local t0 = os.clock()
+		local results
+		local keyEvery = fps * 4
+		local layers = o.Layers or 2
+		local workers = math.floor(tonumber(o.Workers or Config.ImportWorkers) or 1)
+		local ok, err = pcall(function()
+			if o.Codec ~= "FLV1" and workers > 1 and count > keyEvery * 3 and ImportPool.available() then
+				local segs = ImportJob.planSegments(t, ImportJob.idrDisplay(buf, v, t), keyEvery, workers * 2)
+				if #segs > 1 then
+					local jobs = {}
+					for i, sg in ipairs(segs) do
+						jobs[i] = { k0 = sg.k0, k1 = sg.k1, sizes = sizes, maxFps = o.Fps, maxSeconds = o.MaxSeconds, layers = layers,
+							keyEvery = keyEvery }
+					end
+					log(("  %s: %d parts on %d workers"):format(name, #jobs, math.min(workers, #jobs)))
+					-- the sound is decoded and encoded here while the workers encode the picture (its progress isn't shown)
+					local quiet = table.clone(o)
+					quiet.Progress = nil
+					local soundRunning = true
+					task.spawn(function()
+						pcall(sound, quiet)
+						soundRunning = false
+					end)
+					local parts = ImportPool.run(buf, jobs, workers, function(done)
+						if o.Progress then
+							o.Progress("video", math.min(1, done / count))
+						end
+					end)
+					while soundRunning do
+						task.wait(0.1)
+					end
+					if parts then
+						results = {}
+						for si, sz in ipairs(sizes) do
+							local list = table.create(#jobs)
+							for i = 1, #jobs do
+								list[i] = parts[i][si]
+							end
+							local bytes, st = Flv2.assemble(list, sz.w, sz.h, fps, keyEvery, layers)
+							results[si] = { bytes = bytes, stats = st }
+						end
+					end
+				end
+			end
+			if not results then
+				results = encodeSizes(sizes, fps, function(add)
+					local lastYield = os.clock()
+					local function yield()
+						if os.clock() - lastYield > 0.012 then
+							task.wait()
+							lastYield = os.clock()
+						end
+					end
+					ImportJob.mp4Frames(buf, v, t, 0, count, sizes, function(k, imgs)
+						add(imgs)
+						if o.Progress and k % 6 == 0 then
+							o.Progress("video", (k + 1) / count)
+						end
+						if k % 48 == 47 then
+							log(("  %s: %d / %d frames (%.0f s)"):format(name, k + 1, count, os.clock() - t0))
+						end
+						yield()
+					end, yield)
+				end, o)
+			end
+		end)
+		if not ok then
+			error(("%s couldn't be read: %s"):format(fileName, cleanError(err)), 0)
+		end
+		if o.Timing then
+			o.Timing.video = os.clock() - t0
+		end
+		sound(o)
+		local streamBytes, st = finishVideo(results, sizes)
+		attrs.Frames, attrs.Seconds = st.frames, st.seconds
 		if o.Sink then
 			o.Sink("Videos", name, streamBytes, attrs)
 		else
 			Store.write(Importer.videoRoot(streamBytes), name, streamBytes, attrs)
 		end
 		return { kind = "video", name = name, width = ow, height = oh, seconds = st.seconds, bytes = st.bytes,
-			message = ("video %s: %dx%d, %.1f s at %d fps (from %dx%d H.264), %.0f KB (%.1f KB/s)%s"):format(name, ow, oh, st.seconds, fps, srcW, srcH,
-				st.bytes / 1024, st.bytesPerSecond / 1024, audioNote) }
+			message = ("video %s: %dx%d, %.1f s at %d fps (from %dx%d %s), %.0f KB (%.1f KB/s)%s%s"):format(name, ow, oh, st.seconds, fps, srcW, srcH, codecName,
+				st.bytes / 1024, st.bytesPerSecond / 1024, sizesNote(sizes), audioNote) }
 	else -- avi
-		local avi = decode(fileName, Avi.parse, buf)
+		avi = avi or decode(fileName, Avi.parse, buf)
 		local fps = math.min(o.Fps, avi.fps)
 		local seconds = math.min(avi.frameCount / avi.fps, o.MaxSeconds)
 		local count = math.max(1, math.floor(seconds * fps + 1e-6))

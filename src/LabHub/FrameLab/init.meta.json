@@ -37,10 +37,13 @@
       "Float64": 300
     },
     "ImportMaxVideoLines": {
-      "Float64": 480
+      "Float64": 1080
     },
     "ImportVideoQuality": {
       "String": "144p"
+    },
+    "ImportWorkers": {
+      "Float64": 4
     },
     "LibraryDataStore": {
       "Bool": false
@@ -56,6 +59,9 @@
     },
     "RequestsPerSecond": {
       "Float64": 30
+    },
+    "SeekHold": {
+      "Float64": 8
     },
     "SprayCooldown": {
       "Float64": 1.5
@@ -99,6 +105,12 @@
     "SprayViewDistance": {
       "Float64": 150
     },
+    "StreamMaxSeconds": {
+      "Float64": 7200
+    },
+    "StreamMaxSourceLines": {
+      "Float64": 400
+    },
     "TVScale": {
       "Float64": 5
     },
@@ -113,6 +125,15 @@
     },
     "UrlPictureSize": {
       "Float64": 512
+    },
+    "VideoCacheMB": {
+      "Float64": 6
+    },
+    "VideoDecode": {
+      "String": "auto"
+    },
+    "VideoRendition": {
+      "String": "auto"
     },
     "ViewDistance": {
       "Float64": 120

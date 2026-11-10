@@ -8,7 +8,8 @@
 --   Assets.soundFont(path)   decoded SF2 (fallback when there is no baked bank)
 --   Assets.instruments(path) { Bank = bank }: the baked bank, or one built in memory (yields)  (pass into MidiSynth.new)
 --   Assets.preload({ paths }), Assets.clear(prefix?)
---   Assets.addSource(fn)     fn(clipPath) -> bytes or nil: where clips that aren't in Data/Clips come from (FrameLab adds
+--   Assets.usage() -> { files, clips } bytes held (raw files, encoded clips)
+--   Assets.addSource(fn)     fn(clipPath) -> bytes (or a streamed window clip) or nil: where clips that aren't in Data/Clips come from (FrameLab adds
 --                            one on clients: in-game video imports keep their sound on the server and send it on demand).
 --                            On a client, a clip that isn't there waits a few seconds for a source to be added.
 --
@@ -53,6 +54,19 @@ local function get(key, loader)
 	return result
 end
 
+function Assets.usage()
+	local u = { files = 0, clips = 0 }
+	for key, v in pairs(cache) do
+		local n = (typeof(v) == "buffer" and buffer.len(v)) or (type(v) == "string" and #v) or 0
+		if string.sub(key, 1, 5) == "file:" then
+			u.files += n
+		elseif string.sub(key, 1, 5) == "clip:" then
+			u.clips += n
+		end
+	end
+	return u
+end
+
 function Assets.file(path)
 	return get("file:" .. path, function()
 		return Importer.load(path)
@@ -82,7 +96,8 @@ function Assets.clip(path)
 		end
 		for _, fn in ipairs(sources) do
 			local ok, bytes = pcall(fn, clipPath)
-			if ok and typeof(bytes) == "buffer" then
+			-- (or a clip that fills in as it plays: FrameLab's stream sound, a v3 window clip)
+			if ok and (typeof(bytes) == "buffer" or (type(bytes) == "table" and bytes.stream == true)) then
 				return bytes
 			end
 		end

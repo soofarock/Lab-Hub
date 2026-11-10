@@ -16,6 +16,7 @@ return function(FrameLab)
 	local root = script:FindFirstAncestor("FrameLab")
 	local Config = require(game:GetService("ReplicatedStorage"):WaitForChild("LabHub"):WaitForChild("Config"))
 	local Stream = require(root.Video.Stream)
+	local ImportJob = require(root.Tools.ImportJob)
 
 	-- the media runtime makes FrameLab.Server
 	local t0 = os.clock()
@@ -155,6 +156,27 @@ return function(FrameLab)
 		return { width = W, height = H, data = data }
 	end
 
+	-- a picture of a stream (Tools.Live): a second into its first part (downloaded when it started)
+	local function streamFrame(live)
+		local bytes, offset = live.rawChunk(1)
+		if not bytes then
+			error("its first part isn't here", 0)
+		end
+		local k0 = live.raw[1].k0
+		local k1 = live.raw[2] and live.raw[2].k0 or live.frames
+		local s = math.min(1, 160 / math.max(live.width, live.height))
+		local tw, th = math.max(1, math.floor(live.width * s)), math.max(1, math.floor(live.height * s))
+		local got
+		pcall(ImportJob.tsFrames, bytes, k0, k1, offset, live.fps, { { w = tw, h = th } }, function(_, imgs)
+			got = imgs[1]
+			error("enough", 0)
+		end, nil, math.min(k1 - 1, k0 + live.fps))
+		if not got then
+			error("no picture in its first part", 0)
+		end
+		return got
+	end
+
 	local thumbs = {} -- id -> { data, w, h } (this server's copy)
 
 	-- AudioLab imports (sounds: a clip under AudioLab's Data/Clips; music: a MIDI (and SoundFont) under Data/Files)
@@ -225,20 +247,34 @@ return function(FrameLab)
 			id = id, kind = kind, name = result.name, url = url, quality = kind == "video" and quality or nil,
 			seconds = result.seconds, width = result.width, height = result.height, bytes = result.bytes,
 			by = player and player.UserId or 0, byName = player and player.Name or "server", at = os.time(),
+			stream = result.stream == true or nil,
 		}
-		local ok, err = pcall(function()
-			local img = kind == "image" and FrameLab.unpackImage(e.bytes) or videoFrame(e.bytes)
-			local data, w, hgt = thumbOf(img)
-			thumbs[id] = { data = data, w = w, h = hgt }
-			r.tw, r.th = w, hgt
-			if store then
-				store:SetAsync("thumb/" .. id, data)
+		local function makeThumb()
+			local ok, err = pcall(function()
+				local img = kind == "image" and FrameLab.unpackImage(e.bytes) or (e.live and streamFrame(e.live)) or videoFrame(e.bytes)
+				local data, w, hgt = thumbOf(img)
+				thumbs[id] = { data = data, w = w, h = hgt }
+				r.tw, r.th = w, hgt
+				if store then
+					store:SetAsync("thumb/" .. id, data)
+				end
+			end)
+			if not ok and Config.Debug then
+				warn("[FrameLab] library: no thumbnail for " .. tostring(result.name) .. ": " .. tostring(err))
 			end
-		end)
-		if not ok and Config.Debug then
-			warn("[FrameLab] library: no thumbnail for " .. tostring(result.name) .. ": " .. tostring(err))
 		end
 		records[id] = r
+		if e.live then
+			-- (a stream's picture is decoded after it has started playing, not before)
+			task.spawn(function()
+				makeThumb()
+				if r.tw then
+					writeIndex(id)
+				end
+			end)
+		else
+			makeThumb()
+		end
 		writeIndex(id)
 	end
 
@@ -261,6 +297,9 @@ return function(FrameLab)
 	end
 
 	local function sizeOf(e)
+		if e.live and e.live.held then
+			return e.live.held() -- (a stream: the parts it holds right now)
+		end
 		return typeof(e.bytes) == "buffer" and buffer.len(e.bytes) or 0
 	end
 
@@ -337,7 +376,7 @@ return function(FrameLab)
 				id = id, kind = r.kind, name = name or r.name, url = r.url, quality = r.quality, seconds = r.seconds,
 				width = r.width, height = r.height, by = r.byName, at = r.at, loaded = name ~= nil,
 				bytes = e and (sizeOf(e) + soundBytes) or r.bytes, kept = store ~= nil, thumb = r.tw ~= nil, detail = r.detail,
-				soundFontUrl = r.soundFontUrl,
+				soundFontUrl = r.soundFontUrl, stream = r.stream == true or (e ~= nil and e.live ~= nil),
 			})
 		end
 		for kind, k in pairs({ Videos = "video", Images = "image" }) do
@@ -347,6 +386,7 @@ return function(FrameLab)
 					table.insert(out, {
 						id = "session:" .. kind .. ":" .. name, kind = k, name = name, url = a.Url, quality = a.Quality,
 						seconds = a.Seconds, width = a.Width, height = a.Height, loaded = true, bytes = sizeOf(e), kept = false,
+						stream = e.live ~= nil,
 					})
 				end
 			end
@@ -438,7 +478,7 @@ return function(FrameLab)
 		if isAudio(r) then
 			return { error = "import it again from the music player's Import (Studio): its URL is under URL" }
 		end
-		return h.importUrl(player, r.kind, r.url, r.quality)
+		return h.importUrl(player, r.kind, r.url, r.quality, r.stream == true)
 	end
 
 	Players.PlayerRemoving:Connect(function() end)

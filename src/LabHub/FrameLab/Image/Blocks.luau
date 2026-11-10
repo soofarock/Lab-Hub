@@ -9,6 +9,7 @@
 --   local list = Blocks.encode(image, { Threshold = 6, Yield = true }) -> { width, height, count, items = {...} }
 --   local view = Blocks.draw(list, parent, { KeepAspect = true, ZIndex }) -> { Frame, destroy = function }
 --   Blocks.ready() -> the pattern library is available
+--   Blocks.fitBlock(...) / Blocks.errorOf(...) / Blocks.recolor(...): one block's fit, its error, new colours for it
 
 local Blocks = {}
 
@@ -130,6 +131,57 @@ local function fitBlock(data, W, H, x0, y0, BS, stride)
 end
 
 Blocks.fitBlock = fitBlock
+
+-- new colours for a block keeping its pattern (idx; -1: one colour): A r g b, B r g b, rms error. Much cheaper than
+-- fitBlock (no pattern search): a block whose shape still fits only changes colour
+function Blocks.recolor(data, W, H, x0, y0, BS, stride, idx)
+	stride = stride or W
+	local n = BS * BS
+	local sp, spp, sr, sg, sb, spr, spg, spb = 0, 0, 0, 0, 0, 0, 0, 0
+	for y = 0, BS - 1 do
+		local yy = math.min(y0 + y, H - 1)
+		for x = 0, BS - 1 do
+			local xx = math.min(x0 + x, W - 1)
+			local o = (yy * stride + xx) * 4
+			local k = y * BS + x + 1
+			local r, g, b = readu8(data, o), readu8(data, o + 1), readu8(data, o + 2)
+			pr[k], pg[k], pb[k] = r, g, b
+			local p = (idx >= 0) and Patterns.value(BS, idx, k) / 15 or 0
+			av[k] = p
+			sp += p
+			spp += p * p
+			sr += r
+			sg += g
+			sb += b
+			spr += p * r
+			spg += p * g
+			spb += p * b
+		end
+	end
+	local Ar, Ag, Ab, Br, Bg, Bb
+	if idx < 0 then
+		Ar, Ag, Ab = sr / n, sg / n, sb / n
+		Br, Bg, Bb = Ar, Ag, Ab
+	else
+		local det = n * spp - sp * sp
+		if math.abs(det) < 1e-6 then
+			det = 1e-6
+		end
+		Ar = math.clamp((spp * sr - sp * spr) / det, 0, 255)
+		Ag = math.clamp((spp * sg - sp * spg) / det, 0, 255)
+		Ab = math.clamp((spp * sb - sp * spb) / det, 0, 255)
+		Br = math.clamp(Ar + (n * spr - sp * sr) / det, 0, 255)
+		Bg = math.clamp(Ag + (n * spg - sp * sg) / det, 0, 255)
+		Bb = math.clamp(Ab + (n * spb - sp * sb) / det, 0, 255)
+	end
+	local se = 0
+	for k = 1, n do
+		local p = av[k]
+		local er, eg, eb = Ar + p * (Br - Ar) - pr[k], Ag + p * (Bg - Ag) - pg[k], Ab + p * (Bb - Ab) - pb[k]
+		se += er * er + eg * eg + eb * eb
+	end
+	return Ar, Ag, Ab, Br, Bg, Bb, math.sqrt(se / (3 * n))
+end
 
 -- rms error of a drawn block (pattern idx, or -1 for one colour A) against the picture at (x0, y0)
 function Blocks.errorOf(data, W, H, x0, y0, BS, stride, idx, ar, ag, ab, br, bg, bb)

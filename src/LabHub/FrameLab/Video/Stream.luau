@@ -16,6 +16,8 @@
 --   local bytes, stats = w:finish()
 -- Reading (player):
 --   local r = Stream.reader(bytes, { Decompress = function(buf, rawSize) -> buf })
+--       (FLV2 videos and FLV2 rendition sets, "FLVS", open with Video.Flv2's reader: a set at the size
+--       Stream.deviceLines() picks, or options.Rendition)
 --   r.width, r.height, r.fps, r.frameCount, r.pw (padded width: the row stride of r.rgba is pw * 4)
 --   local info = r:advance()       -- applies the next frame to r.rgba; info = { key, dx, dy, blocks = { block ids } }
 --   r:seek(frame)                  -- 0-based; applies the chunk's keyframe and the frames after it
@@ -276,9 +278,113 @@ function Stream.isStream(bytes)
 	return buffer.len(b) >= HEADER and buffer.readstring(b, 0, 4) == Stream.Magic
 end
 
+-- how fast this device runs Luau (ms for a fixed loop; worked out once): Roblox servers and Studio run scripts as
+-- native code, most player devices don't (about 6x slower), and decoding a video is that much work
+local benchMs
+function Stream.benchmark()
+	if benchMs then
+		return benchMs
+	end
+	local b = buffer.create(4096)
+	for i = 0, 4095 do
+		buffer.writeu8(b, i, i % 251)
+	end
+	local best = math.huge
+	for _ = 1, 3 do
+		local t0 = os.clock()
+		local s = 0
+		for _ = 1, 60 do
+			for i = 0, 4094 do
+				local v = buffer.readu8(b, i) * 3 + buffer.readu8(b, i + 1)
+				s += (v > 255) and (v // 2) or v
+			end
+		end
+		best = math.min(best, (os.clock() - t0) * 1000 + s * 0)
+	end
+	benchMs = best
+	return best
+end
+
+-- the most picture lines (the short side) this device plays, for videos imported at several sizes:
+-- Config.VideoRendition "high" (the largest) / "low" (the smallest) / "auto" (default: 180 on every device: redrawing
+-- a 360p picture's thousands of GUI objects keeps the game's frames long even where decoding is fast).
+-- Stream.stepDown (lines): set for the session when a screen here fell behind at a larger size
+Stream.stepDown = nil
+
+-- whether this client decodes streams (HLS addresses, MP4s in stream mode) itself (Video.DirectReader) rather than
+-- showing the server's work: Config.VideoDecode "auto" (default: computers yes, until a screen here falls behind doing
+-- it; phones and tablets no), "client" or "server"
+Stream.directOff = false
+function Stream.decodeStreams()
+	local ok, Config = pcall(function()
+		return require(game:GetService("ReplicatedStorage"):WaitForChild("LabHub"):WaitForChild("Config"))
+	end)
+	local mode = ok and Config.VideoDecode or "auto"
+	if mode == "client" then
+		return true
+	elseif mode == "server" then
+		return false
+	end
+	local UIS = game:GetService("UserInputService")
+	if UIS.TouchEnabled and not UIS.KeyboardEnabled then
+		return false
+	end
+	return not Stream.directOff
+end
+
+-- a stream this client doesn't decode comes as the server's block picture (Video.BlockStream: only the blocks that
+-- change are set here), unless that failed here (Stream.blocksOff: then the server's converted copy)
+Stream.blocksOff = false
+function Stream.blockStreams()
+	return not Stream.blocksOff
+end
+function Stream.deviceLines()
+	local ok, Config = pcall(function()
+		return require(game:GetService("ReplicatedStorage"):WaitForChild("LabHub"):WaitForChild("Config"))
+	end)
+	local mode = ok and Config.VideoRendition or "auto"
+	if mode == "high" then
+		return math.huge
+	elseif mode == "low" then
+		return 0
+	end
+	local lines = 180
+	return Stream.stepDown and math.min(lines, Stream.stepDown) or lines
+end
+
+-- the lines a stream this client decodes itself is shown at (Video.DirectReader): its blocks are worked out on worker
+-- threads too, so a computer shows 360 with Config.VideoRendition "auto" (phones and tablets, and a client that stepped
+-- down, 180); "high" / "low" as for deviceLines
+function Stream.directLines()
+	local lines = Stream.deviceLines()
+	local ok, Config = pcall(function()
+		return require(game:GetService("ReplicatedStorage"):WaitForChild("LabHub"):WaitForChild("Config"))
+	end)
+	if (ok and Config.VideoRendition or "auto") ~= "auto" then
+		return lines
+	end
+	local UIS = game:GetService("UserInputService")
+	if UIS.TouchEnabled and not UIS.KeyboardEnabled then
+		return lines
+	end
+	return Stream.stepDown and math.min(360, Stream.stepDown) or 360
+end
+
 function Stream.reader(bytes, options)
 	options = options or {}
 	local b = type(bytes) == "string" and buffer.fromstring(bytes) or bytes
+	if buffer.len(b) >= 4 and buffer.readstring(b, 0, 4) == "FLVS" then
+		-- one video at several sizes: the one for this device (options.Rendition: its index)
+		local Flv2 = require(script.Parent.Flv2)
+		local list = Flv2.readSet(b)
+		local i = options.Rendition or Flv2.pick(list, Stream.deviceLines())
+		local e = list[math.clamp(i, 1, #list)]
+		local sub = buffer.create(e.size)
+		buffer.copy(sub, 0, b, e.offset, e.size)
+		local r = Flv2.reader(sub, options)
+		r.renditions, r.rendition = list, i
+		return r
+	end
 	if buffer.len(b) >= 4 and buffer.readstring(b, 0, 4) == "FLV2" then
 		return require(script.Parent.Flv2).reader(b, options) -- the small-file codec (same reader interface, plus render())
 	end

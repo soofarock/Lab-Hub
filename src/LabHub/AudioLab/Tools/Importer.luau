@@ -18,7 +18,7 @@ local Importer = {}
 
 local LINE = 4096 -- base64 characters per source line (keeps the script editor responsive)
 local PART_CHARS = 180000 -- per module, under Roblox's 200,000-character Source limit
-local EXTENSIONS = { "wav", "aif", "aiff", "aifc", "mp3", "flac", "ogg", "oga", "mid", "midi", "sf2" }
+local EXTENSIONS = { "wav", "aif", "aiff", "aifc", "mp3", "mp2", "ac3", "flac", "ogg", "oga", "mid", "midi", "sf2" }
 
 local function splitPath(path)
 	local parts = {}

@@ -127,7 +127,7 @@ local function resolve(path, options)
 			end
 		end
 		return { id = path, kind = "midi", midi = path, soundFont = soundFont, title = path }
-	elseif ext == "" or ext == "wav" or ext == "aif" or ext == "aiff" or ext == "aifc" or ext == "mp3" or ext == "flac" or ext == "ogg" or ext == "oga" then
+	elseif ext == "" or ext == "wav" or ext == "aif" or ext == "aiff" or ext == "aifc" or ext == "mp3" or ext == "mp2" or ext == "ac3" or ext == "flac" or ext == "ogg" or ext == "oga" then
 		return { id = path, kind = "clip", clip = path, title = path }
 	end
 	error("AudioLab: unsupported track type ." .. ext .. " (" .. tostring(path) .. ")")

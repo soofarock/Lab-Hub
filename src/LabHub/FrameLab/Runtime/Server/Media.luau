@@ -9,6 +9,11 @@ return function(FrameLab)
 	local Store = FrameLab.Store
 	local Config = require(game:GetService("ReplicatedStorage"):WaitForChild("LabHub"):WaitForChild("Config"))
 	local remotes = Net.remotes(true)
+	if not remotes:FindFirstChild("Cache") then
+		local e = Instance.new("RemoteEvent")
+		e.Name = "Cache"
+		e.Parent = remotes
+	end
 
 	local function serverRoot(kind)
 		local data = ServerStorage:FindFirstChild("FrameLabData")
@@ -77,7 +82,12 @@ return function(FrameLab)
 		return c
 	end
 
+	-- the owner (the place's creator, or rank 254+ in its group), anyone in Admins, and everyone in a Studio test (an
+	-- unpublished place has no creator: the one testing is its developer, as for the owner's settings)
 	local function isAdmin(player)
+		if game:GetService("RunService"):IsStudio() then
+			return true
+		end
 		if game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId then
 			return true
 		end
@@ -96,6 +106,9 @@ return function(FrameLab)
 	end
 	-- seconds a client needs to download an imported video's sound (~300 KB/s with FrameLab.Net.clip, plus a margin)
 	require(root.Sync).soundLoadDelay = function(clip)
+		if string.sub(clip, 1, 7) == "stream/" then
+			return 0 -- (a stream's sound comes in parts as it plays: it joins the picture when its part is in)
+		end
 		local s = session.Sounds[clip]
 		if not s then
 			return 0
@@ -137,15 +150,58 @@ return function(FrameLab)
 		return listOf("Images")
 	end
 	h.isAdmin = function(player)
-		return isAdmin(player)
+		return isAdmin(player) == true
 	end
-	h.videoHead = function(_, name)
+	-- a video's header (an FLV2 one: header and chunk directory). A video kept at several sizes (FLVS) answers for one of
+	-- them: the largest at most `lines` tall, or number `index`; base is where its bytes start in the entry (videoRange
+	-- offsets are the entry's), renditions lists them all ({ width, height, bytesPerSecond })
+	h.videoHead = function(_, name, lines, index, direct)
 		if type(name) ~= "string" then
 			return nil
+		end
+		local se = session.Videos[name]
+		if se and se.live then
+			-- a stream: its header and directory (the chunks are made as they are asked for: liveChunk / liveRange)
+			local live = se.live
+			local list = {}
+			for k, sz in ipairs(live.sizes) do
+				list[k] = { width = sz.w, height = sz.h, bytesPerSecond = (sz.kbps or 60) * 1024 }
+			end
+			if direct == "blocks" and live.blocksHead then
+				-- the block player's own picture, worked out here (Video.BlockStream: rendition -1)
+				return { live = true, blocks = true, size = 0, head = live.blocksHead(), base = 0, rendition = -1,
+					renditions = list, source = { width = live.width, height = live.height }, attrs = table.clone(se.attrs) }
+			end
+			if direct == true then
+				-- unconverted: the client decodes the segments itself (rendition 0)
+				return { live = true, direct = true, size = 0, head = live.rawHead(), base = 0, rendition = 0, renditions = list,
+					source = { width = live.width, height = live.height }, attrs = table.clone(se.attrs) }
+			end
+			local i = tonumber(index) or require(root.Video.Flv2).pick(list, tonumber(lines) or 360)
+			i = math.clamp(math.floor(i), 1, #list)
+			return { live = true, size = 0, head = live.head(i), base = 0, rendition = i, renditions = list,
+				attrs = table.clone(se.attrs) }
 		end
 		local bytes = readEntry("Videos", name)
 		if not bytes then
 			return nil
+		end
+		if buffer.len(bytes) >= 8 and buffer.readstring(bytes, 0, 4) == "FLVS" then
+			local Flv2 = require(root.Video.Flv2)
+			local list = Flv2.readSet(bytes)
+			local i = tonumber(index) or Flv2.pick(list, tonumber(lines) or 360)
+			i = math.clamp(math.floor(i), 1, #list)
+			local e = list[i]
+			local headLen = math.min(e.size, 24 + buffer.readu16(bytes, e.offset + 16) * 16)
+			local head = buffer.create(headLen)
+			buffer.copy(head, 0, bytes, e.offset, headLen)
+			local renditions = {}
+			for k, r in ipairs(list) do
+				renditions[k] = { width = r.width, height = r.height, bytesPerSecond = r.bytesPerSecond }
+			end
+			local _, entry = find("Videos", name)
+			return { size = e.size, head = head, base = e.offset, rendition = i, renditions = renditions,
+				attrs = entry and entry:GetAttributes() or {} }
 		end
 		local headLen = 24
 		if buffer.readstring(bytes, 0, 4) == "FLV2" then
@@ -175,6 +231,202 @@ return function(FrameLab)
 		local out = buffer.create(len)
 		buffer.copy(out, 0, bytes, offset, len)
 		return out
+	end
+	-- a stream's chunk (Tools.Live): { sizeA, sizeB } when it is made, false while it is being made, a message when it
+	-- failed; then its bytes in ranges
+	h.liveChunk = function(_, name, r, ci)
+		local se = type(name) == "string" and session.Videos[name]
+		if not (se and se.live) or type(r) ~= "number" or type(ci) ~= "number" then
+			return nil
+		end
+		if math.floor(r) == -1 then
+			-- a piece of the block picture (Video.BlockStream)
+			local data, why = se.live.blockPiece(math.floor(ci))
+			if data then
+				return { sizeA = buffer.len(data), sizeB = 0 }
+			end
+			return why and tostring(why) or false
+		end
+		if math.floor(r) == 0 then
+			-- a whole segment, unconverted
+			local raw, offset = se.live.rawChunk(math.floor(ci))
+			if raw then
+				return { sizeA = buffer.len(raw), sizeB = 0, offset = offset }
+			end
+			return offset and tostring(offset) or false
+		end
+		local data, a, b = se.live.chunk(math.floor(r), math.floor(ci))
+		if data then
+			return { sizeA = a, sizeB = b }
+		end
+		if a then
+			return tostring(a)
+		end
+		return false
+	end
+	h.liveRange = function(_, name, r, ci, offset, len)
+		local se = type(name) == "string" and session.Videos[name]
+		if not (se and se.live) or type(r) ~= "number" or type(ci) ~= "number" or type(offset) ~= "number" or type(len) ~= "number" then
+			return nil
+		end
+		local data
+		if math.floor(r) == -1 then
+			data = se.live.blockPiece(math.floor(ci))
+		elseif math.floor(r) == 0 then
+			data = se.live.rawChunk(math.floor(ci))
+		else
+			data = se.live.chunk(math.floor(r), math.floor(ci))
+		end
+		if not data then
+			return nil
+		end
+		offset = math.floor(offset)
+		len = math.clamp(math.floor(len), 0, Net.RANGE)
+		if offset < 0 or offset >= buffer.len(data) then
+			return nil
+		end
+		len = math.min(len, buffer.len(data) - offset)
+		local out = buffer.create(len)
+		buffer.copy(out, 0, data, offset, len)
+		return out
+	end
+
+	-- a stream kept in this server's session, named after its file
+	local function addStream(live, url, file, qName, player)
+		local base = "imported/" .. string.sub(string.gsub(file, "[^%w%-_ ]", "_"), 1, 40)
+		local name, n = base, 2
+		while find("Videos", name) do
+			name = base .. "-" .. n
+			n += 1
+		end
+		session.Videos[name] = { live = live, attrs = { Width = live.sizes[1].w, Height = live.sizes[1].h, Fps = live.fps,
+			Frames = live.frames, Seconds = live.seconds, Url = url, Live = true, Bytes = 0, Quality = qName,
+			ImportedBy = player and player.UserId or 0,
+			-- (its sound: AudioLab clips made part by part, which clients fetch as it plays: FrameLab.Video.StreamSound)
+			Audio = live.hasSound and ("clip:stream/" .. name) or nil } }
+		local result = { name = name, kind = "video", width = live.sizes[1].w, height = live.sizes[1].h, seconds = live.seconds,
+			bytes = 0, stream = true }
+		if server.onImported then
+			task.spawn(pcall, server.onImported, result, url, qName, player) -- (its record and picture, for the data manager)
+		end
+		return result
+	end
+
+	-- stream mode (the TV's Stream switch): an MP4 / MOV or VP9 / VP8 WebM address that sends byte ranges plays in parts as it
+	-- is watched, never downloaded whole (Tools.Live.openMp4 / openWebm)
+	local function startMp4Stream(url, qName, player)
+		local Importer = FrameLab.Importer
+		local live = require(root.Tools.Live).openMp4(url, {
+			MaxLines = Config.StreamMaxSourceLines or 400,
+			MaxSeconds = Config.StreamMaxSeconds or 7200,
+			Workers = Config.ImportWorkers or 4,
+			Sizes = function(w, h)
+				return Importer.videoSizes(w, h, qName)
+			end,
+		})
+		local path = string.gsub(url, "[?#].*$", "")
+		local file = string.match(path, "([^/]+)%.%w+$") or string.match(path, "([^/]+)$") or "stream"
+		return addStream(live, url, file, qName, player)
+	end
+
+	-- a stream's sound, part by part (Tools.Live.sound): { size, start } when the part's clip is made, false while it is
+	-- being made, a message for a part without sound (or that failed); then its bytes in ranges
+	h.liveSound = function(_, name, si)
+		local se = type(name) == "string" and session.Videos[name]
+		if not (se and se.live and se.live.hasSound) or type(si) ~= "number" then
+			return "none"
+		end
+		local clip, start = se.live.sound(math.floor(si))
+		if clip then
+			return { size = buffer.len(clip), start = start }
+		end
+		return start and tostring(start) or false
+	end
+	h.liveSoundRange = function(_, name, si, offset, len)
+		local se = type(name) == "string" and session.Videos[name]
+		if not (se and se.live) or type(si) ~= "number" or type(offset) ~= "number" or type(len) ~= "number" then
+			return nil
+		end
+		local clip = se.live.sound(math.floor(si))
+		if not clip then
+			return nil
+		end
+		offset = math.floor(offset)
+		len = math.clamp(math.floor(len), 0, Net.RANGE)
+		if offset < 0 or offset >= buffer.len(clip) then
+			return nil
+		end
+		len = math.min(len, buffer.len(clip) - offset)
+		local out = buffer.create(len)
+		buffer.copy(out, 0, clip, offset, len)
+		return out
+	end
+
+	-- an HLS address (.m3u8): a stream the server converts as it is watched (Tools.Live), kept in this server's session
+	local function startStream(url, text, qName, player)
+		local Importer = FrameLab.Importer
+		local q = Importer.quality(qName)
+		local live = require(root.Tools.Live).open(url, text, {
+			Lines = q.lines,
+			MaxSeconds = Config.StreamMaxSeconds or 7200,
+			Workers = Config.ImportWorkers or 4,
+			Sizes = function(w, h)
+				return Importer.videoSizes(w, h, qName)
+			end,
+		})
+		-- named after the playlist (or its folder, for index / master / playlist)
+		local path = string.gsub(url, "[?#].*$", "")
+		local file = string.match(path, "([^/]+)%.m3u8?$") or "stream"
+		local lowFile = string.lower(file)
+		if lowFile == "index" or lowFile == "master" or lowFile == "playlist" or lowFile == "prog_index" or lowFile == "main" then
+			file = string.match(path, "([^/]+)/[^/]+$") or file
+		end
+		return addStream(live, url, file, qName, player)
+	end
+
+	-- each client's video memory (FrameLab.Net.cacheUsage, sent when it changes), for the admins' data manager
+	local cacheReports = {}
+	h.cacheReport = function(player, u)
+		if type(u) ~= "table" then
+			return nil
+		end
+		cacheReports[player] = { video = tonumber(u.video) or 0, limit = tonumber(u.limit) or 0, streams = tonumber(u.streams) or 0,
+			pictures = tonumber(u.pictures) or 0, sounds = tonumber(u.sounds) or 0, memory = tonumber(u.memory) or 0,
+			luau = tonumber(u.luau) or 0 }
+		return true
+	end
+	h.cacheList = function(player)
+		if not isAdmin(player) then
+			return nil
+		end
+		local out = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			local r = cacheReports[p] or {}
+			table.insert(out, { userId = p.UserId, name = p.Name, display = p.DisplayName, video = r.video or 0, limit = r.limit or 0,
+				streams = r.streams or 0, pictures = r.pictures or 0, sounds = r.sounds or 0, memory = r.memory or 0,
+				luau = r.luau or 0, reported = r.video ~= nil })
+		end
+		table.sort(out, function(a, b)
+			return a.video > b.video
+		end)
+		return out
+	end
+	-- userId: one player's client, nil: everyone's
+	h.cacheClear = function(player, userId)
+		if not isAdmin(player) then
+			return nil
+		end
+		local ev = remotes:FindFirstChild("Cache")
+		if userId == nil then
+			ev:FireAllClients("clear")
+			return true
+		end
+		local target = Players:GetPlayerByUserId(tonumber(userId) or 0)
+		if target then
+			ev:FireClient(target, "clear")
+			return true
+		end
+		return false
 	end
 	h.clipHead = function(_, path)
 		local s = type(path) == "string" and session.Sounds[path]
@@ -266,7 +518,8 @@ return function(FrameLab)
 		end
 	end
 	-- quality: "144p" / "240p" / "360p" (FrameLab.Importer.Qualities) or nil for Config.ImportVideoQuality
-	h.importUrl = function(player, kind, url, quality) -- player nil: server code (FrameLab.Server.importUrl)
+	-- stream: true (the TV's Stream switch) plays an MP4 / MOV in parts as it is watched instead of importing it whole
+	h.importUrl = function(player, kind, url, quality, stream) -- player nil: server code (FrameLab.Server.importUrl)
 		if player ~= nil and not isAdmin(player) then
 			return { error = "only admins can import" }
 		end
@@ -310,6 +563,53 @@ return function(FrameLab)
 					return { error = err2 }
 				end
 				okHttp, r = true, res2
+			elseif stream == true and kind == "video" and not string.find(string.lower(url), "%.m3u8") then
+				-- stream mode; a site that sends no byte ranges: imported whole instead
+				setStatus("reading the video's header", true)
+				local okS, resS = pcall(startMp4Stream, url, qName, player)
+				if okS then
+					return resS
+				end
+				local noRanges = string.find(tostring(resS), "byte ranges", 1, true) ~= nil
+				if not noRanges and not string.find(tostring(resS), "imported whole", 1, true) then
+					return { error = tostring(resS) }
+				end
+				local reason = string.find(tostring(resS), "stream mode's", 1, true) and "too big to stream"
+					or noRanges and "the site can't stream it" or "it can't be streamed"
+				-- (the file's size first, from one byte of it: a file over ImportMaxBytes isn't downloaded at all)
+				local size
+				if not noRanges then
+					local okR, rr = pcall(HttpService.RequestAsync, HttpService, { Url = url, Method = "GET",
+						Headers = { Range = "bytes=0-0" } })
+					if okR and rr.StatusCode == 206 then
+						for k, v in pairs(rr.Headers or {}) do
+							if string.lower(k) == "content-range" then
+								size = tonumber(string.match(v, "/(%d+)"))
+							end
+						end
+					elseif okR and rr.Success then
+						okHttp, r = okR, rr -- (the whole file came: the site ignored the range)
+					end
+				end
+				local limit = Config.ImportMaxBytes or 8388608
+				if size and size > limit then
+					local dims = string.match(tostring(resS), "^(%d+x%d+) ")
+					return { error = ("%s%s, and at %.1f MB it's over the import limit (%.0f MB, ImportMaxBytes): use a smaller copy (up to %dp streams)"):format(
+						dims and (dims .. " is ") or "", reason, size / 1048576, limit / 1048576, Config.StreamMaxSourceLines or 400) }
+				end
+				if not r then
+					-- (the import's own progress takes over once it is here)
+					local label = ("%s: downloading it whole%s"):format(reason, size and (" (%.1f MB)"):format(size / 1048576) or "")
+					local downloading = true
+					task.spawn(function()
+						while downloading do
+							setStatus(("%s - %d s"):format(label, os.clock() - tStart), true)
+							task.wait(1)
+						end
+					end)
+					okHttp, r = pcall(HttpService.RequestAsync, HttpService, { Url = url, Method = "GET" })
+					downloading = false
+				end
 			else
 				okHttp, r = pcall(HttpService.RequestAsync, HttpService, { Url = url, Method = "GET" })
 			end
@@ -354,6 +654,10 @@ return function(FrameLab)
 			end
 			if #r.Body == 0 then
 				return { error = host .. " sent an empty file" }
+			end
+			if kind == "video" and require(root.Tools.Live).isPlaylist(r.Body) then
+				setStatus("reading the stream's playlist", true)
+				return startStream(url, r.Body, qName, player)
 			end
 			local maxBytes = Config.ImportMaxBytes or 8388608
 			if #r.Body > maxBytes then
@@ -461,13 +765,36 @@ return function(FrameLab)
 	end
 	Players.PlayerRemoving:Connect(function(p)
 		budget[p] = nil
+		cacheReports[p] = nil
 	end)
 
 	-- server code (VideoLab.importUrl): the same import, without the admin check
-	server.importUrl = function(kind, url, quality)
-		return h.importUrl(nil, kind, url, quality)
+	server.importUrl = function(kind, url, quality, stream)
+		return h.importUrl(nil, kind, url, quality, stream)
 	end
 	server.listOf = listOf
+	-- a jump on a screen showing a stream (FrameLabServer, on a seek): the segment there starts downloading at once,
+	-- before the clients ask for it
+	server.prefetch = function(name, seconds)
+		local se = type(name) == "string" and session.Videos[name]
+		local live = se and se.live
+		if not live or type(seconds) ~= "number" then
+			return
+		end
+		local f = math.floor(math.max(0, seconds) * live.fps)
+		local si = 1
+		for i, sg in ipairs(live.raw) do
+			if sg.k0 <= f then
+				si = i
+			else
+				break
+			end
+		end
+		live.rawChunk(si)
+		if live.hasSound then
+			live.sound(si) -- (its sound too)
+		end
+	end
 
 	FrameLab.Server = server
 end

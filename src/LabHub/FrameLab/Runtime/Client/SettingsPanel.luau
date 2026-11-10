@@ -479,9 +479,17 @@ return function(FrameLab)
 	if hubOk and LabHub then
 		local hub = LabHub.add({
 			id = "settings", label = "Settings", order = 90, toggle = win,
+			-- asks again (a few times) while the server gives no answer: a request can go unanswered while the
+			-- server is still starting, or be dropped when a player sends many at once
 			available = function()
-				local ok, d = pcall(Net.invoke, "settingsGet")
-				return ok and type(d) == "table" and d.owner == true
+				for attempt = 1, 6 do
+					local ok, d = pcall(Net.invoke, "settingsGet")
+					if ok and type(d) == "table" then
+						return d.owner == true
+					end
+					task.wait(attempt)
+				end
+				return false
 			end,
 		})
 		closeB.Activated:Connect(function()

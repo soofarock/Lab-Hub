@@ -1,7 +1,8 @@
 -- Started by FrameLab:init() on a client: the data manager panel (admins). Opened from the TV picker's "Data" button
 -- (FrameLab.openDataManager()). Lists this server's imports and the kept records (Runtime/Server/Library): thumbnail,
 -- name, kind, quality, length, size, who imported it, whether it is in memory; Load (import again from its URL),
--- Delete, and the URL to copy. The header shows how much the server holds.
+-- Delete, and the URL to copy. The header shows how much the server holds. Clients: each player's video memory
+-- (FrameLab.Net.cacheUsage) against its limit (VideoCacheMB), with Clear for one player or everyone.
 return function(FrameLab)
 	local Players = game:GetService("Players")
 	local player = Players.LocalPlayer
@@ -134,6 +135,14 @@ return function(FrameLab)
 			end
 			task.spawn(refresh)
 		end)
+		local view = "items" -- or "clients"
+		local clientsBtn = btn(panel, "Clients", 72)
+		clientsBtn.Position = UDim2.new(1, -272, 0, 0)
+		clientsBtn.Activated:Connect(function()
+			view = view == "items" and "clients" or "items"
+			clientsBtn.Text = view == "clients" and "Imports" or "Clients"
+			task.spawn(refresh)
+		end)
 		local stats = make("TextLabel", {
 			Size = UDim2.new(1, 0, 0, 18), Position = UDim2.new(0, 0, 0, 26), BackgroundTransparency = 1, Text = "loading...",
 			TextColor3 = C.dim, Font = Enum.Font.Gotham, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
@@ -155,13 +164,102 @@ return function(FrameLab)
 		lp.Parent = list
 
 		local busy = false
+		local function clearRows()
+			for _, c in ipairs(list:GetChildren()) do
+				if c:IsA("Frame") then
+					c:Destroy()
+				end
+			end
+		end
+		local function refreshClients()
+			local ok, rows = pcall(Net.invoke, "cacheList")
+			if not gui or view ~= "clients" then
+				return
+			end
+			if not ok or type(rows) ~= "table" then
+				stats.Text = "only admins can see the clients"
+				return
+			end
+			local total, full = 0, 0
+			for _, r in ipairs(rows) do
+				total += r.video
+				if r.limit > 0 and r.video >= r.limit * 0.95 then
+					full += 1
+				end
+			end
+			stats.Text = ("%d players, %s of video in their memory%s"):format(#rows, mb(total), full > 0 and ("  -  %d at the limit"):format(full) or "")
+			clearRows()
+			local top = make("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, LayoutOrder = 0 }, list)
+			local all = btn(top, "Clear all", 80, C.red)
+			all.Activated:Connect(function()
+				pcall(Net.invoke, "cacheClear", nil)
+				task.delay(1, refresh)
+			end)
+			make("TextLabel", {
+				Size = UDim2.new(1, -90, 1, 0), Position = UDim2.new(0, 90, 0, 0), BackgroundTransparency = 1,
+				Text = "video each client keeps (VideoCacheMB); Clear drops its pictures and all video but what its screens show", TextColor3 = C.dim,
+				Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+			}, top)
+			for i, r in ipairs(rows) do
+				local row = make("Frame", { Size = UDim2.new(1, 0, 0, 60), BackgroundColor3 = C.row, LayoutOrder = i, Corner = true }, list)
+				make("TextLabel", {
+					Size = UDim2.new(1, -90, 0, 18), Position = UDim2.new(0, 8, 0, 4), BackgroundTransparency = 1,
+					Text = ("%s (@%s)"):format(r.display, r.name), TextColor3 = C.text, Font = Enum.Font.GothamMedium, TextSize = 13,
+					TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
+				}, row)
+				local f = r.limit > 0 and math.clamp(r.video / r.limit, 0, 1) or 0
+				local barBg = make("Frame", {
+					Size = UDim2.new(0.5, 0, 0, 8), Position = UDim2.new(0, 8, 0, 28), BackgroundColor3 = C.panel, BorderSizePixel = 0,
+				}, row)
+				make("Frame", {
+					Size = UDim2.fromScale(f, 1), BorderSizePixel = 0,
+					BackgroundColor3 = f >= 0.95 and C.red or (f >= 0.8 and C.amber or C.green),
+				}, barBg)
+				make("TextLabel", {
+					Size = UDim2.new(0.5, -100, 0, 14), Position = UDim2.new(0.5, 16, 0, 25), BackgroundTransparency = 1,
+					Text = r.reported and ("%s of %s  -  %d video%s"):format(mb(r.video), mb(r.limit), r.streams, r.streams == 1 and "" or "s")
+						or "nothing played yet",
+					TextColor3 = C.dim, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+				}, row)
+				-- what else the client holds, and its whole memory
+				make("TextLabel", {
+					Size = UDim2.new(1, -90, 0, 14), Position = UDim2.new(0, 8, 0, 40), BackgroundTransparency = 1,
+					Text = r.reported and ("pictures %s  -  sounds %s  -  memory %.0f MB (Luau %.0f MB)"):format(mb(r.pictures or 0),
+						mb(r.sounds or 0), r.memory or 0, r.luau or 0) or "",
+					TextColor3 = C.dim, Font = Enum.Font.Gotham, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+				}, row)
+				local b = btn(row, "Clear", 64, C.red)
+				b.AnchorPoint = Vector2.new(1, 0.5)
+				b.Position = UDim2.new(1, -8, 0.5, 0)
+				b.Activated:Connect(function()
+					b.Text = "..."
+					pcall(Net.invoke, "cacheClear", r.userId)
+					task.delay(1, refresh)
+				end)
+			end
+		end
+		-- the client list follows the players while it is shown
+		local thisGui = gui
+		task.spawn(function()
+			while gui == thisGui do
+				task.wait(3)
+				if gui == thisGui and view == "clients" then
+					refreshClients()
+				end
+			end
+		end)
 		function refresh()
 			if not gui then
 				return
 			end
+			if view == "clients" then
+				refreshClients()
+				return
+			end
 			local okS, st = pcall(Net.invoke, "libStats")
 			local okL, items = pcall(Net.invoke, "libList")
-			if not gui then
+			if not gui or view ~= "items" then
 				return
 			end
 			if not okL or type(items) ~= "table" then
@@ -174,11 +272,7 @@ return function(FrameLab)
 					or (st.storeError and ("DataStore unavailable: " .. st.storeError) or "records in this server only (DataStore off)")
 				stats.Text = ("%d items in this server's memory, %s  -  %s"):format(st.entries, mb(st.bytes), recs)
 			end
-			for _, c in ipairs(list:GetChildren()) do
-				if c:IsA("Frame") then
-					c:Destroy()
-				end
-			end
+			clearRows()
 			if #items == 0 then
 				make("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, list)
 				make("TextLabel", {
@@ -208,7 +302,7 @@ return function(FrameLab)
 					TextColor3 = C.text, Font = Enum.Font.GothamMedium, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left,
 					TextTruncate = Enum.TextTruncate.AtEnd,
 				}, row)
-				local info = { it.kind == "image" and "picture" or (audio and (it.kind == "music" and "AudioLab music" or "AudioLab sound")) or "video" }
+				local info = { it.kind == "image" and "picture" or (audio and (it.kind == "music" and "AudioLab music" or "AudioLab sound")) or (it.stream and "stream" or "video") }
 				if it.detail then
 					table.insert(info, it.detail)
 				end
@@ -230,7 +324,8 @@ return function(FrameLab)
 					Text = table.concat(info, "  -  "), TextColor3 = C.dim, Font = Enum.Font.Gotham, TextSize = 11,
 					TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd,
 				}, row)
-				local status = it.loaded and (it.kept and "in memory, kept" or "in memory (this server only)")
+				local status = it.loaded and (it.stream and "streaming: the parts being watched are held (this server only)"
+					or (it.kept and "in memory, kept" or "in memory (this server only)"))
 					or (audio and "kept, not loaded (import it again in the music player, Studio)" or "kept, not loaded")
 				make("TextLabel", {
 					Size = UDim2.new(1, -330, 0, 16), Position = UDim2.new(0, 108, 0, 42), BackgroundTransparency = 1, Text = status,

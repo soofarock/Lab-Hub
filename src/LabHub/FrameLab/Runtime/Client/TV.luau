@@ -104,7 +104,7 @@ return function(FrameLab)
 		importRow.Visible = false
 		importRow.Parent = panel
 		local urlBox = Instance.new("TextBox")
-		urlBox.Size = UDim2.new(1, -152, 1, 0)
+		urlBox.Size = UDim2.new(1, -228, 1, 0)
 		urlBox.BackgroundColor3 = Color3.fromRGB(28, 32, 41)
 		urlBox.TextColor3 = Color3.fromRGB(230, 233, 240)
 		urlBox.PlaceholderText = "video URL: MP4, GIF, WebP, AVI, or a YouTube link"
@@ -132,6 +132,23 @@ return function(FrameLab)
 			quality = QUALITIES[(table.find(QUALITIES, quality) or 1) % #QUALITIES + 1]
 			qualityBtn.Text = quality
 			playerGui:SetAttribute("FrameLabImportQuality", quality)
+		end)
+		-- Stream: an address plays in parts as it is watched (an MP4 / MOV up to 360p, or HLS), started on this TV at once,
+		-- instead of being imported whole first (this client remembers the switch)
+		local streamMode = playerGui:GetAttribute("FrameLabStreamMode") == true
+		local streamBtn = button(importRow, "", 70)
+		streamBtn.Position = UDim2.new(1, -220, 0, 0)
+		local function showStream()
+			streamBtn.Text = streamMode and "Stream: on" or "Stream: off"
+			streamBtn.BackgroundColor3 = streamMode and Color3.fromRGB(190, 30, 55) or Color3.fromRGB(34, 38, 48)
+			urlBox.PlaceholderText = streamMode and "stream URL: MP4 / MOV (up to 360p) or .m3u8 - plays right away"
+				or "video URL: MP4, GIF, WebP, AVI, or a YouTube link"
+		end
+		showStream()
+		streamBtn.MouseButton1Click:Connect(function()
+			streamMode = not streamMode
+			playerGui:SetAttribute("FrameLabStreamMode", streamMode)
+			showStream()
 		end)
 		task.spawn(function()
 			importRow.Visible = Net.isAdmin()
@@ -195,7 +212,7 @@ return function(FrameLab)
 					task.wait(0.25)
 				end
 			end)
-			local ok, res = pcall(Net.invoke, "importUrl", "video", urlBox.Text, quality)
+			local ok, res = pcall(Net.invoke, "importUrl", "video", urlBox.Text, quality, streamMode)
 			importing = false
 			importBtn.Text = "Import"
 			if picker ~= sg then
@@ -205,6 +222,12 @@ return function(FrameLab)
 				title.Text = "That didn't import"
 			elseif res.error then
 				title.Text = res.error
+			elseif streamMode and res.stream then
+				-- stream mode: it plays on this TV straight away
+				urlBox.Text = ""
+				Net.forget()
+				Sync.request(tv, "play", { Video = res.name, Loop = true })
+				closePicker()
 			else
 				-- the new video joins the list (the panel stays as it is)
 				title.Text = ("Imported %s (%.1f s): pick it below"):format(res.name, res.seconds or 0)
@@ -428,6 +451,13 @@ return function(FrameLab)
 		track.BackgroundTransparency = 0.65
 		track.BorderSizePixel = 0
 		track.Parent = hit
+		-- the parts of the video this player already holds (YouTube's lighter line): jumping there starts at once
+		local held = Instance.new("Frame")
+		held.Name = "Held"
+		held.Size = UDim2.fromScale(1, 1)
+		held.BackgroundTransparency = 1
+		held.Parent = track
+		local heldBars, heldAt = {}, 0
 		local hover = Instance.new("Frame") -- where a click would land
 		hover.Size = UDim2.new(0, 0, 1, 0)
 		hover.BackgroundColor3 = WHITE
@@ -664,6 +694,27 @@ return function(FrameLab)
 			local f = d > 0 and math.clamp(shown / d, 0, 1) or 0
 			fill.Size = UDim2.new(f, 0, 1, 0)
 			knob.Position = UDim2.new(f, 0, 0.5, 0)
+			if os.clock() - heldAt > 0.25 then
+				heldAt = os.clock()
+				local ranges = Net.buffered(tv:GetAttribute("FrameLabVideo"))
+				for i, rg in ipairs(ranges) do
+					local b = heldBars[i]
+					if not b then
+						b = Instance.new("Frame")
+						b.BackgroundColor3 = WHITE
+						b.BackgroundTransparency = 0.45
+						b.BorderSizePixel = 0
+						b.Parent = held
+						heldBars[i] = b
+					end
+					b.Visible = true
+					b.Position = UDim2.fromScale(rg[1], 0)
+					b.Size = UDim2.fromScale(rg[2] - rg[1], 1)
+				end
+				for i = #ranges + 1, #heldBars do
+					heldBars[i].Visible = false
+				end
+			end
 			timeLabel.Text = clock(shown) .. " / " .. clock(d)
 			local isPlaying = playing()
 			playBtn.Text = isPlaying and "II" or ">"

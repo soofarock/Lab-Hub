@@ -7,13 +7,14 @@
 --
 --   local dec = H264.new(avcC)               -- avcC from Mp4.parse (nalLength, sps, pps), or nil for Annex B input
 --   local pic = dec:decodeSample(buf, pos, len)   -- one access unit (an MP4 sample) -> the decoded picture or nil
+--   local pic = dec:decodeAccessUnit(buf, pos, len) -- the same for an Annex B access unit (MPEG-TS / HLS)
 --   pic.Y, pic.U, pic.V (padded planes), pic.ys / pic.cs (strides), pic.yo / pic.co (offset of pixel 0,0),
 --   dec.width, dec.height (cropped size), dec.cropX, dec.cropY, dec.fullRange, dec.bt709
 --   The planes are valid until the next decodeSample call.
 
 local band, bor, bxor, rshift, lshift, arshift = bit32.band, bit32.bor, bit32.bxor, bit32.rshift, bit32.lshift, bit32.arshift
 local countlz, byteswap = bit32.countlz, bit32.byteswap
-local readu8, writeu8, readu32 = buffer.readu8, buffer.writeu8, buffer.readu32
+local readu8, writeu8, readu32, writeu32 = buffer.readu8, buffer.writeu8, buffer.readu32, buffer.writeu32
 local abs, min, max = math.abs, math.min, math.max
 
 local H264 = {}
@@ -347,13 +348,13 @@ local function cabacBitPos()
 	return CP * 8 - CB
 end
 local function cabacInitContexts(sliceQp, initIdc, isI)
-	local qp = sliceQp < 0 and 0 or (sliceQp > 51 and 51 or sliceQp)
+	local qp = math.clamp(sliceQp, 0, 51)
 	local tab = isI and CTXI or CTXPB
 	local base = isI and 0 or initIdc * 2048
 	for i = 0, 1023 do
 		local m, n = tab[base + i * 2 + 1], tab[base + i * 2 + 2]
 		local pre = (m * qp) // 16 + n
-		pre = pre < 1 and 1 or (pre > 126 and 126 or pre)
+		pre = math.clamp(pre, 1, 126)
 		if pre <= 63 then
 			CTX[i + 1] = (63 - pre) * 2
 		else
@@ -1262,7 +1263,7 @@ local function tap6(P, o, s)
 	return readu8(P, o - 2 * s) - 5 * readu8(P, o - s) + 20 * readu8(P, o) + 20 * readu8(P, o + s) - 5 * readu8(P, o + 2 * s) + readu8(P, o + 3 * s)
 end
 local function clip255(v)
-	return v < 0 and 0 or (v > 255 and 255 or v)
+	return math.clamp(v, 0, 255)
 end
 
 local PATCH = buffer.create(48 * 48)
@@ -1270,102 +1271,149 @@ local PATCH_STRIDE = 48
 
 -- luma motion compensation of a w x h block at integer (xi, yi) + quarter (xf, yf) from plane P (origin org,
 -- stride st, size W x H): writes into dst (stride 16) at dOff
-local function lumaMC(P, org, st, W, Hh, xi, yi, xf, yf, w, h, dst, dOff)
-	local src, base, ss
+local HT = table.create(21 * 16, 0) -- unrounded horizontal half samples of rows -2 .. h + 2 (stride 16)
+local function lumaMC(P: buffer, org: number, st: number, W: number, Hh: number, xi: number, yi: number, xf: number,
+	yf: number, w: number, h: number, dst: buffer, dOff: number)
+	local src: buffer, base: number, ss: number
 	if xi - 2 >= -PADY and yi - 2 >= -PADY and xi + w + 3 < W + PADY and yi + h + 3 < Hh + PADY then
 		src, base, ss = P, org + yi * st + xi, st
 	else
 		-- far outside: copy a clamped patch
 		for y = -2, h + 3 do
-			local sy = yi + y
-			sy = sy < 0 and 0 or (sy > Hh - 1 and Hh - 1 or sy)
+			local sy = math.clamp(yi + y, 0, Hh - 1)
 			for x = -2, w + 3 do
-				local sx = xi + x
-				sx = sx < 0 and 0 or (sx > W - 1 and W - 1 or sx)
+				local sx = math.clamp(xi + x, 0, W - 1)
 				writeu8(PATCH, (y + 2) * PATCH_STRIDE + x + 2, readu8(P, org + sy * st + sx))
 			end
 		end
 		src, base, ss = PATCH, 2 * PATCH_STRIDE + 2, PATCH_STRIDE
 	end
-	for y = 0, h - 1 do
-		local so = base + y * ss
-		local d = dOff + y * 16
-		if xf == 0 and yf == 0 then
-			for x = 0, w - 1 do
-				writeu8(dst, d + x, readu8(src, so + x))
-			end
-		elseif yf == 0 then
+	if xf == 0 and yf == 0 then
+		for y = 0, h - 1 do
+			buffer.copy(dst, dOff + y * 16, src, base + y * ss, w)
+		end
+		return
+	end
+	if yf == 0 then
+		local q = xf == 3 and 1 or 0
+		for y = 0, h - 1 do
+			local so = base + y * ss
+			local d = dOff + y * 16
 			for x = 0, w - 1 do
 				local o = so + x
-				local b = clip255((tap6(src, o, 1) + 16) // 32)
-				if xf == 1 then
-					b = (readu8(src, o) + b + 1) // 2
-				elseif xf == 3 then
-					b = (readu8(src, o + 1) + b + 1) // 2
+				local b = math.clamp((readu8(src, o - 2) - 5 * readu8(src, o - 1) + 20 * readu8(src, o) + 20 * readu8(src, o + 1)
+					- 5 * readu8(src, o + 2) + readu8(src, o + 3) + 16) // 32, 0, 255)
+				if xf ~= 2 then
+					b = (readu8(src, o + q) + b + 1) // 2
 				end
 				writeu8(dst, d + x, b)
 			end
-		elseif xf == 0 then
+		end
+		return
+	end
+	if xf == 0 then
+		local q = yf == 3 and ss or 0
+		local s2 = 2 * ss
+		for y = 0, h - 1 do
+			local so = base + y * ss
+			local d = dOff + y * 16
 			for x = 0, w - 1 do
 				local o = so + x
-				local hh = clip255((tap6(src, o, ss) + 16) // 32)
-				if yf == 1 then
-					hh = (readu8(src, o) + hh + 1) // 2
-				elseif yf == 3 then
-					hh = (readu8(src, o + ss) + hh + 1) // 2
+				local hh = math.clamp((readu8(src, o - s2) - 5 * readu8(src, o - ss) + 20 * readu8(src, o) + 20 * readu8(src, o + ss)
+					- 5 * readu8(src, o + s2) + readu8(src, o + s2 + ss) + 16) // 32, 0, 255)
+				if yf ~= 2 then
+					hh = (readu8(src, o + q) + hh + 1) // 2
 				end
 				writeu8(dst, d + x, hh)
 			end
-		elseif xf == 2 or yf == 2 then
+		end
+		return
+	end
+	if xf == 2 or yf == 2 then
+		-- j: the centre half sample from unrounded horizontal halves
+		for r = 0, h + 4 do
+			local so = base + (r - 2) * ss
+			local t = r * 16 + 1
 			for x = 0, w - 1 do
 				local o = so + x
-				-- j: the centre half sample from unrounded horizontal halves
-				local j = tap6(src, o - 2 * ss, 1) - 5 * tap6(src, o - ss, 1) + 20 * tap6(src, o, 1) + 20 * tap6(src, o + ss, 1)
-					- 5 * tap6(src, o + 2 * ss, 1) + tap6(src, o + 3 * ss, 1)
-				j = clip255((j + 512) // 1024)
-				local v
-				if xf == 2 and yf == 2 then
-					v = j
-				elseif xf == 2 then
-					local b = clip255((tap6(src, yf == 1 and o or o + ss, 1) + 16) // 32)
-					v = (b + j + 1) // 2
+				HT[t + x] = readu8(src, o - 2) - 5 * readu8(src, o - 1) + 20 * readu8(src, o) + 20 * readu8(src, o + 1)
+					- 5 * readu8(src, o + 2) + readu8(src, o + 3)
+			end
+		end
+		local s2 = 2 * ss
+		local hq = yf == 3 and 16 or 0 -- (xf 2: the horizontal half of row y or y + 1)
+		local vq = xf == 3 and 1 or 0 -- (yf 2: the vertical half of column x or x + 1)
+		for y = 0, h - 1 do
+			local d = dOff + y * 16
+			local so = base + y * ss
+			for x = 0, w - 1 do
+				local t = (y + 2) * 16 + x + 1
+				local j = math.clamp((HT[t - 32] - 5 * HT[t - 16] + 20 * HT[t] + 20 * HT[t + 16] - 5 * HT[t + 32] + HT[t + 48] + 512) // 1024, 0, 255)
+				if xf == 2 then
+					if yf ~= 2 then
+						j = (math.clamp((HT[t + hq] + 16) // 32, 0, 255) + j + 1) // 2
+					end
 				else
-					local hh = clip255((tap6(src, xf == 1 and o or o + 1, ss) + 16) // 32)
-					v = (hh + j + 1) // 2
+					local o = so + x + vq
+					local hh = math.clamp((readu8(src, o - s2) - 5 * readu8(src, o - ss) + 20 * readu8(src, o) + 20 * readu8(src, o + ss)
+						- 5 * readu8(src, o + s2) + readu8(src, o + s2 + ss) + 16) // 32, 0, 255)
+					j = (hh + j + 1) // 2
 				end
-				writeu8(dst, d + x, v)
+				writeu8(dst, d + x, j)
 			end
-		else
-			for x = 0, w - 1 do
-				local o = so + x
-				local b = clip255((tap6(src, yf == 1 and o or o + ss, 1) + 16) // 32)
-				local hh = clip255((tap6(src, xf == 1 and o or o + 1, ss) + 16) // 32)
-				writeu8(dst, d + x, (b + hh + 1) // 2)
-			end
+		end
+		return
+	end
+	-- diagonal quarter samples: the horizontal half of row y or y + 1 and the vertical half of column x or x + 1
+	local bq = yf == 3 and ss or 0
+	local vq = xf == 3 and 1 or 0
+	local s2 = 2 * ss
+	for y = 0, h - 1 do
+		local so = base + y * ss
+		local d = dOff + y * 16
+		for x = 0, w - 1 do
+			local o = so + x
+			local ob = o + bq
+			local b = math.clamp((readu8(src, ob - 2) - 5 * readu8(src, ob - 1) + 20 * readu8(src, ob) + 20 * readu8(src, ob + 1)
+				- 5 * readu8(src, ob + 2) + readu8(src, ob + 3) + 16) // 32, 0, 255)
+			local ov = o + vq
+			local hh = math.clamp((readu8(src, ov - s2) - 5 * readu8(src, ov - ss) + 20 * readu8(src, ov) + 20 * readu8(src, ov + ss)
+				- 5 * readu8(src, ov + s2) + readu8(src, ov + s2 + ss) + 16) // 32, 0, 255)
+			writeu8(dst, d + x, (b + hh + 1) // 2)
 		end
 	end
 end
 
 -- chroma motion compensation (eighth sample, bilinear) into dst (stride 8)
-local function chromaMC(P, org, st, W, Hh, xi, yi, xf, yf, w, h, dst, dOff)
-	local inside = xi >= -PADC and yi >= -PADC and xi + w + 1 < W + PADC and yi + h + 1 < Hh + PADC
+local function chromaMC(P: buffer, org: number, st: number, W: number, Hh: number, xi: number, yi: number, xf: number,
+	yf: number, w: number, h: number, dst: buffer, dOff: number)
+	if xi >= -PADC and yi >= -PADC and xi + w + 1 < W + PADC and yi + h + 1 < Hh + PADC then
+		if xf == 0 and yf == 0 then
+			for y = 0, h - 1 do
+				buffer.copy(dst, dOff + y * 8, P, org + (yi + y) * st + xi, w)
+			end
+			return
+		end
+		local w00, w10, w01, w11 = (8 - xf) * (8 - yf), xf * (8 - yf), (8 - xf) * yf, xf * yf
+		for y = 0, h - 1 do
+			local o = org + (yi + y) * st + xi
+			local d = dOff + y * 8
+			for x = 0, w - 1 do
+				local q = o + x
+				writeu8(dst, d + x, (w00 * readu8(P, q) + w10 * readu8(P, q + 1) + w01 * readu8(P, q + st) + w11 * readu8(P, q + st + 1) + 32) // 64)
+			end
+		end
+		return
+	end
 	local w00, w10, w01, w11 = (8 - xf) * (8 - yf), xf * (8 - yf), (8 - xf) * yf, xf * yf
 	for y = 0, h - 1 do
+		local y0 = math.clamp(yi + y, 0, Hh - 1)
+		local y1 = math.clamp(yi + y + 1, 0, Hh - 1)
 		for x = 0, w - 1 do
-			local a, b, c, d
-			if inside then
-				local o = org + (yi + y) * st + xi + x
-				a, b, c, d = readu8(P, o), readu8(P, o + 1), readu8(P, o + st), readu8(P, o + st + 1)
-			else
-				local x0, y0 = xi + x, yi + y
-				local x1, y1 = x0 + 1, y0 + 1
-				x0 = x0 < 0 and 0 or (x0 > W - 1 and W - 1 or x0)
-				x1 = x1 < 0 and 0 or (x1 > W - 1 and W - 1 or x1)
-				y0 = y0 < 0 and 0 or (y0 > Hh - 1 and Hh - 1 or y0)
-				y1 = y1 < 0 and 0 or (y1 > Hh - 1 and Hh - 1 or y1)
-				a, b = readu8(P, org + y0 * st + x0), readu8(P, org + y0 * st + x1)
-				c, d = readu8(P, org + y1 * st + x0), readu8(P, org + y1 * st + x1)
-			end
+			local x0 = math.clamp(xi + x, 0, W - 1)
+			local x1 = math.clamp(xi + x + 1, 0, W - 1)
+			local a, b = readu8(P, org + y0 * st + x0), readu8(P, org + y0 * st + x1)
+			local c, d = readu8(P, org + y1 * st + x0), readu8(P, org + y1 * st + x1)
 			writeu8(dst, dOff + y * 8 + x, (w00 * a + w10 * b + w01 * c + w11 * d + 32) // 64)
 		end
 	end
@@ -1493,6 +1541,11 @@ local function decodeSlice(D, h, pic)
 	local qpOff1, qpOff2 = pps.chromaQpOffset, pps.chromaQpOffset2
 	local direct8x8 = sps.direct8x8
 	local col = isB and L1[1] or nil
+	local colIntra, colRef0, colRef1, colMv0x, colMv0y, colMv1x, colMv1y, colRp0, colRp1
+	if col then
+		colIntra, colRef0, colRef1 = col.intra, col.ref0, col.ref1
+		colMv0x, colMv0y, colMv1x, colMv1y, colRp0, colRp1 = col.mv0x, col.mv0y, col.mv1x, col.mv1y, col.rp0, col.rp1
+	end
 
 	-- weights
 	local logWDl, logWDc, wtab = 0, 0, nil
@@ -2747,8 +2800,10 @@ local function decodeSlice(D, h, pic)
 			end
 		end
 		-- combine into the picture
-		local yo2 = yo + ly * ys + lx
-		local co2 = co + cy * cs + cx
+		local Yd: buffer, Ud: buffer, Vd: buffer = Yp, Up, Vp
+		local yst, cst = ys, cs
+		local yo2 = yo + ly * yst + lx
+		local co2 = co + cy * cst + cx
 		if r0 >= 0 and r1 >= 0 then
 			local w0, w1, o0, o1, lw = nil, nil, 0, 0, 0
 			local cw0u, cw1u, co0u, co1u, cw0v, cw1v, co0v, co1v, lwc
@@ -2757,6 +2812,9 @@ local function decodeSlice(D, h, pic)
 				w0, w1, lw = c[1], c[2], 5
 				cw0u, cw1u, cw0v, cw1v, lwc = w0, w1, w0, w1, 5
 				co0u, co1u, co0v, co1v = 0, 0, 0, 0
+				if w0 == 32 and w1 == 32 then
+					w0 = nil -- (equal weights: the plain average)
+				end
 			elseif wtab then
 				local e0, e1 = wtab[0][r0], wtab[1][r1]
 				w0, w1, o0, o1, lw = e0.lw, e1.lw, e0.lo, e1.lo, logWDl
@@ -2765,71 +2823,100 @@ local function decodeSlice(D, h, pic)
 				lwc = logWDc
 			end
 			if w0 then
-				local rnd, sh, off = lshift(1, lw), lw + 1, (o0 + o1 + 1) // 2
+				local rnd, div, off = lshift(1, lw), lshift(1, lw + 1), (o0 + o1 + 1) // 2
 				for y = 0, hgt - 1 do
+					local s = dl + y * 16
+					local d = yo2 + y * yst
 					for x = 0, w - 1 do
-						local s = dl + y * 16 + x
-						writeu8(Yp, yo2 + y * ys + x, clip255(((readu8(PY0, s) * w0 + readu8(PY1, s) * w1 + rnd) // lshift(1, sh)) + off))
+						writeu8(Yd, d + x, math.clamp((readu8(PY0, s + x) * w0 + readu8(PY1, s + x) * w1 + rnd) // div + off, 0, 255))
 					end
 				end
 				local rc, shc = lshift(1, lwc), lshift(1, lwc + 1)
 				local offu, offv = (co0u + co1u + 1) // 2, (co0v + co1v + 1) // 2
 				for y = 0, ch - 1 do
+					local s = dc + y * 8
+					local d = co2 + y * cst
 					for x = 0, cw - 1 do
-						local s = dc + y * 8 + x
-						writeu8(Up, co2 + y * cs + x, clip255(((readu8(PU0, s) * cw0u + readu8(PU1, s) * cw1u + rc) // shc) + offu))
-						writeu8(Vp, co2 + y * cs + x, clip255(((readu8(PV0, s) * cw0v + readu8(PV1, s) * cw1v + rc) // shc) + offv))
+						writeu8(Ud, d + x, math.clamp((readu8(PU0, s + x) * cw0u + readu8(PU1, s + x) * cw1u + rc) // shc + offu, 0, 255))
+						writeu8(Vd, d + x, math.clamp((readu8(PV0, s + x) * cw0v + readu8(PV1, s + x) * cw1v + rc) // shc + offv, 0, 255))
 					end
 				end
 			else
+				-- the rounded average, four samples at a time: (a | b) - ((a ^ b) >> 1) per byte
 				for y = 0, hgt - 1 do
-					for x = 0, w - 1 do
-						local s = dl + y * 16 + x
-						writeu8(Yp, yo2 + y * ys + x, (readu8(PY0, s) + readu8(PY1, s) + 1) // 2)
+					local s = dl + y * 16
+					local d = yo2 + y * yst
+					for x = 0, w - 1, 4 do
+						local a, b = readu32(PY0, s + x), readu32(PY1, s + x)
+						writeu32(Yd, d + x, bor(a, b) - rshift(band(bxor(a, b), 0xFEFEFEFE), 1))
 					end
 				end
-				for y = 0, ch - 1 do
-					for x = 0, cw - 1 do
-						local s = dc + y * 8 + x
-						writeu8(Up, co2 + y * cs + x, (readu8(PU0, s) + readu8(PU1, s) + 1) // 2)
-						writeu8(Vp, co2 + y * cs + x, (readu8(PV0, s) + readu8(PV1, s) + 1) // 2)
+				if cw >= 4 then
+					for y = 0, ch - 1 do
+						local s = dc + y * 8
+						local d = co2 + y * cst
+						for x = 0, cw - 1, 4 do
+							local a, b = readu32(PU0, s + x), readu32(PU1, s + x)
+							writeu32(Ud, d + x, bor(a, b) - rshift(band(bxor(a, b), 0xFEFEFEFE), 1))
+							a, b = readu32(PV0, s + x), readu32(PV1, s + x)
+							writeu32(Vd, d + x, bor(a, b) - rshift(band(bxor(a, b), 0xFEFEFEFE), 1))
+						end
+					end
+				else
+					for y = 0, ch - 1 do
+						local s = dc + y * 8
+						local d = co2 + y * cst
+						for x = 0, cw - 1 do
+							writeu8(Ud, d + x, (readu8(PU0, s + x) + readu8(PU1, s + x) + 1) // 2)
+							writeu8(Vd, d + x, (readu8(PV0, s + x) + readu8(PV1, s + x) + 1) // 2)
+						end
 					end
 				end
 			end
 		else
 			local list = r0 >= 0 and 0 or 1
 			local r = r0 >= 0 and r0 or r1
-			local sY = list == 0 and PY0 or PY1
-			local sU = list == 0 and PU0 or PU1
-			local sV = list == 0 and PV0 or PV1
+			local sY: buffer = list == 0 and PY0 or PY1
+			local sU: buffer = list == 0 and PU0 or PU1
+			local sV: buffer = list == 0 and PV0 or PV1
 			local e = wtab and wtab[list] and wtab[list][r]
 			if e then
 				local lw = logWDl
-				local function wl(v, wgt, o, l)
-					if l >= 1 then
-						return clip255(((v * wgt + lshift(1, l - 1)) // lshift(1, l)) + o)
-					end
-					return clip255(v * wgt + o)
-				end
+				local wgt, o = e.lw, e.lo
 				for y = 0, hgt - 1 do
 					for x = 0, w - 1 do
-						writeu8(Yp, yo2 + y * ys + x, wl(readu8(sY, dl + y * 16 + x), e.lw, e.lo, lw))
+						local v = readu8(sY, dl + y * 16 + x)
+						if lw >= 1 then
+							v = (v * wgt + lshift(1, lw - 1)) // lshift(1, lw) + o
+						else
+							v = v * wgt + o
+						end
+						writeu8(Yd, yo2 + y * yst + x, math.clamp(v, 0, 255))
 					end
 				end
+				local lc = logWDc
 				for y = 0, ch - 1 do
 					for x = 0, cw - 1 do
 						local s = dc + y * 8 + x
-						writeu8(Up, co2 + y * cs + x, wl(readu8(sU, s), e.cw1, e.co1, logWDc))
-						writeu8(Vp, co2 + y * cs + x, wl(readu8(sV, s), e.cw2, e.co2, logWDc))
+						local u, v = readu8(sU, s), readu8(sV, s)
+						if lc >= 1 then
+							u = (u * e.cw1 + lshift(1, lc - 1)) // lshift(1, lc) + e.co1
+							v = (v * e.cw2 + lshift(1, lc - 1)) // lshift(1, lc) + e.co2
+						else
+							u = u * e.cw1 + e.co1
+							v = v * e.cw2 + e.co2
+						end
+						writeu8(Ud, co2 + y * cst + x, math.clamp(u, 0, 255))
+						writeu8(Vd, co2 + y * cst + x, math.clamp(v, 0, 255))
 					end
 				end
 			else
 				for y = 0, hgt - 1 do
-					buffer.copy(Yp, yo2 + y * ys, sY, dl + y * 16, w)
+					buffer.copy(Yd, yo2 + y * yst, sY, dl + y * 16, w)
 				end
 				for y = 0, ch - 1 do
-					buffer.copy(Up, co2 + y * cs, sU, dc + y * 8, cw)
-					buffer.copy(Vp, co2 + y * cs, sV, dc + y * 8, cw)
+					buffer.copy(Ud, co2 + y * cst, sU, dc + y * 8, cw)
+					buffer.copy(Vd, co2 + y * cst, sV, dc + y * 8, cw)
 				end
 			end
 		end
@@ -2863,14 +2950,15 @@ local function decodeSlice(D, h, pic)
 			cbx = bx < 2 and 0 or 3
 			cby = by < 2 and 0 or 3
 		end
-		if col.intra[mbAddr + 1] then
+		if colIntra[mbAddr + 1] then
 			return -1, 0, 0, 0
 		end
 		local i = (mby * 4 + cby) * W4 + mbx * 4 + cbx + 1
-		if col.ref0[i] >= 0 then
-			return col.ref0[i], col.mv0x[i], col.mv0y[i], col.rp0[i]
+		local r = colRef0[i]
+		if r >= 0 then
+			return r, colMv0x[i], colMv0y[i], colRp0[i]
 		end
-		return col.ref1[i], col.mv1x[i], col.mv1y[i], col.rp1[i]
+		return colRef1[i], colMv1x[i], colMv1y[i], colRp1[i]
 	end
 	local function minPositive(a, b)
 		if a >= 0 and b >= 0 then
@@ -2912,24 +3000,34 @@ local function decodeSlice(D, h, pic)
 			end
 			local c = spatialCache
 			local l1Long = L1[1].isLong
+			local cr0, cr1, zero = c[1], c[2], c[7]
+			local uid0, uid1 = 0, 0
+			if cr0 >= 0 then
+				uid0 = L0[cr0 + 1].uid
+			end
+			if cr1 >= 0 then
+				uid1 = L1[cr1 + 1].uid
+			end
 			for y = by0, by0 + size - 1 do
 				for x = bx0, bx0 + size - 1 do
 					local m0x, m0y, m1x, m1y = c[3], c[4], c[5], c[6]
-					if c[7] then
+					if zero then
 						m0x, m0y, m1x, m1y = 0, 0, 0, 0
 					else
 						local rcol, cmx, cmy = colInfo(x, y)
 						if not l1Long and rcol == 0 and cmx >= -1 and cmx <= 1 and cmy >= -1 and cmy <= 1 then
-							if c[1] == 0 then
+							if cr0 == 0 then
 								m0x, m0y = 0, 0
 							end
-							if c[2] == 0 then
+							if cr1 == 0 then
 								m1x, m1y = 0, 0
 							end
 						end
 					end
-					setMotion(x, y, 1, 1, 0, c[1], m0x, m0y, 0, 0)
-					setMotion(x, y, 1, 1, 1, c[2], m1x, m1y, 0, 0)
+					local i = (mby * 4 + y) * W4 + mbx * 4 + x + 1
+					ref0[i], mv0x[i], mv0y[i], rp0[i] = cr0, m0x, m0y, uid0
+					ref1[i], mv1x[i], mv1y[i], rp1[i] = cr1, m1x, m1y, uid1
+					mvd0x[i], mvd0y[i], mvd1x[i], mvd1y[i] = 0, 0, 0, 0
 				end
 			end
 		else
@@ -2977,6 +3075,22 @@ local function decodeSlice(D, h, pic)
 	end
 	-- prediction for direct regions: one call per block group that shares motion
 	local function predictDirect(bx0, by0, size)
+		-- (one prediction for the whole region when all its blocks share their motion)
+		local i0 = (mby * 4 + by0) * W4 + mbx * 4 + bx0 + 1
+		local r0, r1, a, b, c, d = ref0[i0], ref1[i0], mv0x[i0], mv0y[i0], mv1x[i0], mv1y[i0]
+		local same = true
+		for y = by0, by0 + size - 1 do
+			for x = bx0, bx0 + size - 1 do
+				local i = (mby * 4 + y) * W4 + mbx * 4 + x + 1
+				if ref0[i] ~= r0 or ref1[i] ~= r1 or mv0x[i] ~= a or mv0y[i] ~= b or mv1x[i] ~= c or mv1y[i] ~= d then
+					same = false
+				end
+			end
+		end
+		if same then
+			predictPart(bx0, by0, size, size)
+			return
+		end
 		if direct8x8 then
 			for y = by0, by0 + size - 1, 2 do
 				for x = bx0, bx0 + size - 1, 2 do
@@ -3332,11 +3446,12 @@ local function decodeSlice(D, h, pic)
 		end
 	end
 
+	local DdbIdc, DdbA, DdbB, DdbQpOff, DdbQpOff2 = D.dbIdc, D.dbA, D.dbB, D.dbQpOff, D.dbQpOff2
 	local function beginMb(kind)
 		mbSlice[mbAddr + 1] = sliceNum
 		mbKind[mbAddr + 1] = kind
-		D.dbIdc[mbAddr + 1], D.dbA[mbAddr + 1], D.dbB[mbAddr + 1] = dbIdc, dbA, dbB
-		D.dbQpOff[mbAddr + 1], D.dbQpOff2[mbAddr + 1] = qpOff1, qpOff2
+		DdbIdc[mbAddr + 1], DdbA[mbAddr + 1], DdbB[mbAddr + 1] = dbIdc, dbA, dbB
+		DdbQpOff[mbAddr + 1], DdbQpOff2[mbAddr + 1] = qpOff1, qpOff2
 		mbDcCbf[mbAddr + 1] = 0
 		mbT8[mbAddr + 1] = false
 		mbChroma[mbAddr + 1] = 0
@@ -3813,51 +3928,73 @@ local function deblockPicture(D, pic)
 	local mv0x, mv0y, mv1x, mv1y = pic.mv0x, pic.mv0y, pic.mv1x, pic.mv1y
 	local bS = table.create(4, 0)
 
-	local function mvFar(ax, ay, bx, by)
-		return abs(ax - bx) >= 4 or abs(ay - by) >= 4
-	end
 	local function strength(pi, qi, pmb, qmb, mbEdge)
 		if intra[pmb + 1] or intra[qmb + 1] then
-			return mbEdge and 4 or 3
+			if mbEdge then
+				return 4
+			end
+			return 3
 		end
 		if coef[pi] or coef[qi] then
 			return 2
 		end
-		local pa = ref0[pi] >= 0 and rp0[pi] or nil
-		local pb = ref1[pi] >= 0 and rp1[pi] or nil
-		local qa = ref0[qi] >= 0 and rp0[qi] or nil
-		local qb = ref1[qi] >= 0 and rp1[qi] or nil
-		local np = (pa and 1 or 0) + (pb and 1 or 0)
-		local nq = (qa and 1 or 0) + (qb and 1 or 0)
+		-- the pictures each side predicts from (uids; 0: that list unused)
+		local pa, pb, qa, qb, np, nq = 0, 0, 0, 0, 0, 0
+		if ref0[pi] >= 0 then
+			pa, np = rp0[pi], 1
+		end
+		if ref1[pi] >= 0 then
+			pb, np = rp1[pi], np + 1
+		end
+		if ref0[qi] >= 0 then
+			qa, nq = rp0[qi], 1
+		end
+		if ref1[qi] >= 0 then
+			qb, nq = rp1[qi], nq + 1
+		end
 		if np ~= nq then
 			return 1
 		end
+		if np == 0 then
+			return 0
+		end
 		if np == 1 then
-			local pr = pa or pb
-			local qr = qa or qb
-			if pr ~= qr then
+			local pr, pmx, pmy = pa, mv0x[pi], mv0y[pi]
+			if pa == 0 then
+				pr, pmx, pmy = pb, mv1x[pi], mv1y[pi]
+			end
+			local qr, qmx, qmy = qa, mv0x[qi], mv0y[qi]
+			if qa == 0 then
+				qr, qmx, qmy = qb, mv1x[qi], mv1y[qi]
+			end
+			if pr ~= qr or abs(pmx - qmx) >= 4 or abs(pmy - qmy) >= 4 then
 				return 1
 			end
-			local pmx, pmy = pa and mv0x[pi] or mv1x[pi], pa and mv0y[pi] or mv1y[pi]
-			local qmx, qmy = qa and mv0x[qi] or mv1x[qi], qa and mv0y[qi] or mv1y[qi]
-			return mvFar(pmx, pmy, qmx, qmy) and 1 or 0
-		end
-		if np == 0 then
 			return 0
 		end
 		-- two motion vectors each
 		if not ((pa == qa and pb == qb) or (pa == qb and pb == qa)) then
 			return 1
 		end
+		local p0x, p0y, p1x, p1y = mv0x[pi], mv0y[pi], mv1x[pi], mv1y[pi]
+		local q0x, q0y, q1x, q1y = mv0x[qi], mv0y[qi], mv1x[qi], mv1y[qi]
 		if pa ~= pb then
 			if pa == qa then
-				return (mvFar(mv0x[pi], mv0y[pi], mv0x[qi], mv0y[qi]) or mvFar(mv1x[pi], mv1y[pi], mv1x[qi], mv1y[qi])) and 1 or 0
+				if abs(p0x - q0x) >= 4 or abs(p0y - q0y) >= 4 or abs(p1x - q1x) >= 4 or abs(p1y - q1y) >= 4 then
+					return 1
+				end
+				return 0
 			end
-			return (mvFar(mv0x[pi], mv0y[pi], mv1x[qi], mv1y[qi]) or mvFar(mv1x[pi], mv1y[pi], mv0x[qi], mv0y[qi])) and 1 or 0
+			if abs(p0x - q1x) >= 4 or abs(p0y - q1y) >= 4 or abs(p1x - q0x) >= 4 or abs(p1y - q0y) >= 4 then
+				return 1
+			end
+			return 0
 		end
-		local straight = mvFar(mv0x[pi], mv0y[pi], mv0x[qi], mv0y[qi]) or mvFar(mv1x[pi], mv1y[pi], mv1x[qi], mv1y[qi])
-		local crossed = mvFar(mv0x[pi], mv0y[pi], mv1x[qi], mv1y[qi]) or mvFar(mv1x[pi], mv1y[pi], mv0x[qi], mv0y[qi])
-		return (straight and crossed) and 1 or 0
+		if (abs(p0x - q0x) >= 4 or abs(p0y - q0y) >= 4 or abs(p1x - q1x) >= 4 or abs(p1y - q1y) >= 4)
+			and (abs(p0x - q1x) >= 4 or abs(p0y - q1y) >= 4 or abs(p1x - q0x) >= 4 or abs(p1y - q0y) >= 4) then
+			return 1
+		end
+		return 0
 	end
 
 	-- filter `n` lines across an edge: sample q0 of line k at o + k * along, p side at -step
@@ -3875,17 +4012,17 @@ local function deblockPicture(D, pic)
 						local tc0 = TC0[indexA * 4 + s + 1]
 						local tc = tc0 + (ap < beta and 1 or 0) + (aq < beta and 1 or 0)
 						local delta = (((q0 - p0) * 4) + (p1 - q1) + 4) // 8
-						delta = delta < -tc and -tc or (delta > tc and tc or delta)
+						delta = math.clamp(delta, -tc, tc)
 						writeu8(P, q - step, clip255(p0 + delta))
 						writeu8(P, q, clip255(q0 - delta))
 						if ap < beta then
 							local d = (p2 + ((p0 + q0 + 1) // 2) - p1 * 2) // 2
-							d = d < -tc0 and -tc0 or (d > tc0 and tc0 or d)
+							d = math.clamp(d, -tc0, tc0)
 							writeu8(P, q - 2 * step, clip255(p1 + d))
 						end
 						if aq < beta then
 							local d = (q2 + ((p0 + q0 + 1) // 2) - q1 * 2) // 2
-							d = d < -tc0 and -tc0 or (d > tc0 and tc0 or d)
+							d = math.clamp(d, -tc0, tc0)
 							writeu8(P, q + step, clip255(q1 + d))
 						end
 					else
@@ -3922,7 +4059,7 @@ local function deblockPicture(D, pic)
 					if s < 4 then
 						local tc = TC0[indexA * 4 + s + 1] + 1
 						local delta = (((q0 - p0) * 4) + (p1 - q1) + 4) // 8
-						delta = delta < -tc and -tc or (delta > tc and tc or delta)
+						delta = math.clamp(delta, -tc, tc)
 						writeu8(P, q - step, clip255(p0 + delta))
 						writeu8(P, q, clip255(q0 - delta))
 					else
@@ -4151,6 +4288,31 @@ function Decoder:decodeSample(buf, pos, len)
 		end
 		self:nal(buf, pos, n)
 		pos += n
+	end
+	local pic = finishPicture(self)
+	return pic or self.finished
+end
+
+-- one access unit as Annex B bytes (00 00 01 start codes: an MPEG-TS / HLS video packet) -> the picture or nil
+function Decoder:decodeAccessUnit(buf, pos, len)
+	local stop = pos + len
+	self.finished = nil
+	local starts = {}
+	local i = pos
+	while i + 3 <= stop do
+		if readu8(buf, i) == 0 and readu8(buf, i + 1) == 0 and readu8(buf, i + 2) == 1 then
+			table.insert(starts, i + 3)
+			i += 3
+		else
+			i += 1
+		end
+	end
+	for k, s in ipairs(starts) do
+		local e = starts[k + 1] and starts[k + 1] - 3 or stop
+		while e > s and readu8(buf, e - 1) == 0 do
+			e -= 1
+		end
+		self:nal(buf, s, e - s)
 	end
 	local pic = finishPicture(self)
 	return pic or self.finished

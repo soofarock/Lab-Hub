@@ -1,13 +1,18 @@
 --!native
 --!optimize 2
 -- MP4 / MOV (ISO base media) demuxer: finds the video track and lists its samples (frames) with their byte ranges
--- and timestamps, plus the decoder setup (avcC for H.264).
+-- and timestamps, plus the decoder setup (avcC for H.264, hvcC for H.265, av1C for AV1).
 --
 --   local m = Mp4.parse(bytes)
 --   m.video = { codec = "avc1", width, height, timescale, duration (s), samples = { { pos, size, dts, pts, sync } } (decode
 --               order, times in seconds), avcC = { nalLength, sps = { buffer }, pps = { buffer }, profile, level } }
+--               H.265 / HEVC: codec "hvc1" / "hev1", hvcC = the hvcC box's payload (buffer)
+--               AV1: codec "av01", av1C = the av1C box's payload (buffer)
+--               MPEG-4 Part 2 video: codec "mp4v", config = its VOL headers (from the esds; an MPEG-1 / MPEG-2 track in
+--               the same box is named "m2v1")
 --   m.audio = { codec = "mp4a", channels, sampleRate, timescale, samples, esds = { oti, asc = buffer } (mp4a: oti 0x40 / 0x66-0x68
---               = AAC, 0x69 / 0x6B = MP3), skip = samples of encoder delay to drop (from the edit list) } or nil
+--               = AAC, 0x69 / 0x6B = MP3), dOps = buffer (codec "Opus": the Opus setup box), skip = samples of encoder
+--               delay to drop (from the edit list) } or nil
 --   Mp4.isMp4(bytes)
 
 local Mp4 = {}
@@ -87,7 +92,8 @@ local function parseTrack(b, s, e)
 				tr.mediaDuration = be32(b, p + 16)
 			end
 		elseif t == "hdlr" then
-			tr.handler = buffer.readstring(b, p + 8, 4)
+			-- (the media's handler: a QuickTime file has a second one, for its data reference, inside minf)
+			tr.handler = tr.handler or buffer.readstring(b, p + 8, 4)
 		elseif t == "elst" then
 			local v = readu8(b, p)
 			local n = be32(b, p + 4)
@@ -109,11 +115,18 @@ local function parseTrack(b, s, e)
 				local size = be32(b, o)
 				local fmt = buffer.readstring(b, o + 4, 4)
 				tr.codec = fmt
-				if tr.handler == "vide" or fmt == "avc1" or fmt == "avc3" or fmt == "hvc1" or fmt == "hev1" then
+				if tr.handler == "vide" or fmt == "avc1" or fmt == "avc3" or fmt == "hvc1" or fmt == "hev1" or fmt == "av01" then
 					tr.width = be16(b, o + 32)
 					tr.height = be16(b, o + 34)
 					boxes(b, o + 86, math.min(o + size, q), function(ct, cp, cq)
-						if ct == "avcC" then
+						if ct == "esds" then
+							tr.esds = Mp4.readEsds(b, cp + 4, cq)
+							tr.config = tr.esds.asc
+							local oti = tr.esds.oti or 0x20
+							if fmt == "mp4v" and ((oti >= 0x60 and oti <= 0x65) or oti == 0x6A) then
+								tr.codec = "m2v1"
+							end
+						elseif ct == "avcC" then
 							local nalLength = bit32.band(readu8(b, cp + 4), 3) + 1
 							local cfg = { nalLength = nalLength, sps = {}, pps = {}, profile = readu8(b, cp + 1), level = readu8(b, cp + 3) }
 							local c = cp + 5
@@ -136,6 +149,14 @@ local function parseTrack(b, s, e)
 								c += 2 + l
 							end
 							tr.avcC = cfg
+						elseif ct == "hvcC" then
+							local nb = buffer.create(cq - cp)
+							buffer.copy(nb, 0, b, cp, cq - cp)
+							tr.hvcC = nb
+						elseif ct == "av1C" then
+							local nb = buffer.create(cq - cp)
+							buffer.copy(nb, 0, b, cp, cq - cp)
+							tr.av1C = nb
 						end
 					end)
 				else
@@ -148,6 +169,16 @@ local function parseTrack(b, s, e)
 						boxes(b, p0, p1, function(ct, cp, cq)
 							if ct == "esds" then
 								tr.esds = Mp4.readEsds(b, cp + 4, cq)
+								return false
+							elseif ct == "dOps" then
+								local nb = buffer.create(cq - cp)
+								buffer.copy(nb, 0, b, cp, cq - cp)
+								tr.dOps = nb
+								return false
+							elseif ct == "dfLa" then
+								local nb = buffer.create(cq - cp)
+								buffer.copy(nb, 0, b, cp, cq - cp)
+								tr.dfLa = nb -- (FLAC: version and flags, then the metadata blocks)
 								return false
 							elseif ct == "wave" then
 								findEsds(cp, cq)

@@ -47,7 +47,7 @@ function Library.list()
 					id = path, kind = "midi", midi = path, soundFont = soundFonts[folder], folder = folder,
 					title = (folder ~= "" and (folder .. " - ") or "") .. base,
 				})
-			elseif ext == "wav" or ext == "aif" or ext == "aiff" or ext == "aifc" or ext == "mp3" or ext == "flac" or ext == "ogg" or ext == "oga" then
+			elseif ext == "wav" or ext == "aif" or ext == "aiff" or ext == "aifc" or ext == "mp3" or ext == "mp2" or ext == "ac3" or ext == "flac" or ext == "ogg" or ext == "oga" then
 				local clipPath = string.gsub(path, "%.%w+$", "")
 				clipsSeen[clipPath] = true
 				table.insert(tracks, { id = path, kind = "clip", clip = path, folder = folder, title = (folder ~= "" and (folder .. " - ") or "") .. base })

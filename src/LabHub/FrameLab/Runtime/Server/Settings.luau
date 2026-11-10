@@ -92,13 +92,25 @@ return function(FrameLab)
 			end
 		end
 	end
+	-- read in the background, so requests are answered from the start; a request that needs the saved settings waits
+	-- for the read (up to 10 s)
+	local loaded = store == nil
 	if store then
-		local okG, v = pcall(store.GetAsync, store, KEY)
-		if okG then
-			saved = v
-			apply(v)
-		else
-			storeError = tostring(v)
+		task.spawn(function()
+			local okG, v = pcall(store.GetAsync, store, KEY)
+			if okG then
+				saved = v
+				apply(v)
+			else
+				storeError = tostring(v)
+			end
+			loaded = true
+		end)
+	end
+	local function whenLoaded()
+		local t = os.clock()
+		while not loaded and os.clock() - t < 10 do
+			task.wait(0.1)
 		end
 	end
 
@@ -124,8 +136,9 @@ return function(FrameLab)
 
 	h.settingsGet = function(player)
 		if not isOwner(player) then
-			return nil
+			return { owner = false }
 		end
+		whenLoaded()
 		local items = {}
 		for _, s in ipairs(schema()) do
 			local sv = nil
@@ -141,6 +154,7 @@ return function(FrameLab)
 	end
 
 	h.settingsSet = function(player, folder, key, value)
+		whenLoaded() -- (a change made before the saved settings arrive would be overwritten by them)
 		if not isOwner(player) then
 			return { error = "only the owner" }
 		end
@@ -244,6 +258,7 @@ return function(FrameLab)
 
 	-- keep every setting's current value; every server applies them when it starts
 	h.settingsSave = function(player)
+		whenLoaded()
 		if not isOwner(player) then
 			return { error = "only the owner" }
 		end
@@ -264,6 +279,7 @@ return function(FrameLab)
 	end
 
 	h.settingsClear = function(player)
+		whenLoaded()
 		if not isOwner(player) then
 			return { error = "only the owner" }
 		end

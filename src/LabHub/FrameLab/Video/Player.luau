@@ -5,7 +5,8 @@
 --
 --   player.Tolerance   how far (0..255) a strip may stray from the picture before it is redrawn (lower = sharper)
 --   player.Budget      most strip updates per video frame (the rest catch up over the next frames)
---   player.MaxFps      frames per second shown (at most the video's, at most 24)
+--   player.MaxFps      frames per second shown (at most the video's, at most 24; with AutoQuality a half or a third of
+--                      that while the device can't finish its pictures in time)
 --   player.AutoQuality true: Tolerance and Budget follow the device (keeps the player's work near TargetMs per frame)
 --   player.TargetMs    work per screen frame the auto quality aims for (default 3 ms)
 --   player.MaxGradients most strips drawn with a gradient (Roblox draws about a thousand at once, all GUIs together:
@@ -13,12 +14,20 @@
 --                      into the most strips (default 820). Every strip has a gradient of its own, so this is the strip
 --                      budget; the Tolerance is picked for it before the first picture and at every cut / jump.
 --   FLV2 videos (the small-file codec) are decoded here too; with AutoQuality a device that can't keep up skips the
---   droppable half of the frames (12 fps) until it can again, and MaxFps 12 or less always skips them.
+--   droppable half of the frames (12 fps) until it can again, and MaxFps 12 or less always skips them. A video kept
+--   at several sizes plays at the one Video.Stream picks for the device (options.Rendition: a given one); on a device
+--   without native code the colour is worked out without the chroma blend (options.FastColour). An FLV2 video is
+--   decoded on a worker thread a second ahead of the picture (Video.AsyncReader; options.Parallel = false: not).
+--
+-- Paced: a picture is finished and shown before the next one starts (the frames the clock passed meanwhile are skipped),
+-- and with the block player a picture worked out over several screen frames is shown all at once, never its new top
+-- over its old bottom.
 --
 -- A whole-picture move in the stream (a camera pan) slides the canvas with one write; only the uncovered edge is
 -- drawn. Strip objects come from a pool and are never destroyed while the video plays.
 --
 --   local p = Player.new(streamBytes, parent, { Loop, Clock = function() -> seconds, Tolerance, Budget, MaxFps, ... })
+--       (options.Reader: a reader of your own instead, e.g. Video.DirectReader for a stream this client decodes)
 --   p:play() / p:pause() / p:resume() / p:stop() / p:seek(seconds) / p:destroy()
 --   p:getTime(), p.Duration, p.Ended (event), p.Stats (strips, updates, ms, behind)
 
@@ -47,8 +56,25 @@ end
 function Player.new(bytes, parent, options)
 	options = options or {}
 	local self = setmetatable({}, Player)
-	local reader = Stream.reader(bytes, { Decompress = decompress, Ready = options.Ready })
+	local reader = options.Reader or Stream.reader(bytes, { Decompress = decompress, Ready = options.Ready, ChunkData = options.ChunkData,
+		Rendition = options.Rendition })
 	self.reader = reader
+	-- (FLV2 on a device without native code: colour without the chroma blend, half the colour work)
+	if options.FastColour ~= nil then
+		reader.FastColour = options.FastColour
+	else
+		reader.FastColour = Stream.benchmark() > 3.5
+	end
+	-- an FLV2 video decodes on a worker thread, ahead of the picture (Video.AsyncReader; options.Parallel = false: on the
+	-- game's own thread), so the game's frames keep only the drawing (and the sound's timing doesn't wait on decoding)
+	local parallel = options.Parallel ~= false
+	if parallel and reader.codec == "FLV2" then
+		local AsyncReader = require(FrameLab.Video.AsyncReader)
+		if AsyncReader.available() then
+			reader = AsyncReader.wrap(reader, options) or reader
+			self.reader = reader
+		end
+	end
 	self.W, self.H = reader.width, reader.height
 	self.fps = reader.fps
 	self.Duration = reader.duration
@@ -93,6 +119,9 @@ function Player.new(bytes, parent, options)
 	self.Stats = { strips = 0, updates = 0, ms = 0, behind = 0, frame = -1, decodeMs = 0, halfRate = false }
 	self.emaMs = 0
 	self.decodeEma = 0
+	self.pending = {} -- block changes worked out but not shown yet (see workBlocks)
+	self.fitPend = {} -- blocks a reader worked out itself (info.fits: cell -> its fit), shown together
+	self.FpsCap = self.MaxFps
 	self.endedEvent = Instance.new("BindableEvent")
 	self.Ended = self.endedEvent.Event
 	self.playing = false
@@ -109,6 +138,15 @@ local function markRow(self, y)
 end
 
 local function markAll(self)
+	-- (every row is worked out again: block changes not shown yet are dropped)
+	if self.pending then
+		table.clear(self.pending)
+	end
+	if self.reader and self.reader.fits then
+		table.clear(self.fitPend) -- (its next picture comes with every block)
+		self.fitDirty = false
+		return
+	end
 	for y = 0, self.H - 1 do
 		markRow(self, y)
 	end
@@ -344,6 +382,14 @@ local function applyFrame(self, info)
 	if not info then
 		return
 	end
+	if info.fits then
+		-- (a reader whose blocks were worked out on other threads, Video.DirectReader: only set here)
+		for _, f in ipairs(info.fits) do
+			self.fitPend[f[1]] = f
+		end
+		self.fitDirty = true
+		return
+	end
 	if info.dx ~= 0 or info.dy ~= 0 then
 		self.ox += info.dx
 		self.oy += info.dy
@@ -484,7 +530,35 @@ end
 
 -- the block player: bring the 8x8 blocks of the dirty rows up to date. A block is refitted only when the drawn one
 -- misses the new picture by more than BlockSkip (and redrawn only when the new fit is better). Time-limited
--- (TargetMs x 2, x 4 for a whole new picture); the rest goes on next screen frame.
+-- (TargetMs x 2, x 4 for a whole video frame); the rest goes on next screen frame (a picture too big for the device
+-- then shows its new top over its old bottom for a moment: FrameLabClient moves such a screen to the video's smaller
+-- size)
+local function commitBlocks(self)
+	local grid = self.canvas
+	for _, p in ipairs(self.pending) do
+		if p[3] == nil then
+			grid:setSplit(p[1], p[2])
+		else
+			grid:set(p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8])
+		end
+	end
+	table.clear(self.pending)
+end
+
+-- the blocks a reader worked out (info.fits), all at once
+local function commitFits(self)
+	local grid = self.canvas
+	for ci, f in pairs(self.fitPend) do
+		if f[2] == -2 then
+			grid:setSplit(ci, f[3])
+		else
+			grid:set(ci, f[2], f[3], f[4], f[5], f[6], f[7], f[8])
+		end
+	end
+	table.clear(self.fitPend)
+	self.fitDirty = false
+end
+
 local function workBlocks(self, unlimited)
 	local t0 = os.clock()
 	local limit = self.TargetMs * (unlimited and 4 or 2) / 1000
@@ -493,7 +567,9 @@ local function workBlocks(self, unlimited)
 	local W, H = self.W, self.H
 	local cols = grid.cols
 	local skip = self.BlockSkip
-	local fit, errorOf = Blocks.fitBlock, Blocks.errorOf
+	local fit, errorOf, recolor = Blocks.fitBlock, Blocks.errorOf, Blocks.recolor
+	-- (batched: the changes are kept until the whole picture is worked out, then shown together)
+	local pend = self.Batch and self.pending or nil
 	local done = {}
 	local used = 0
 	local q = self.queue
@@ -523,7 +599,21 @@ local function workBlocks(self, unlimited)
 					local k = grid.col[ci]
 					curErr = errorOf(px, W, H, x0, y0, 8, pw, cur, k[1], k[2], k[3], k[4], k[5], k[6])
 				end
-				if curErr > skip then
+				-- (a block whose shape still fits gets new colours only: no pattern search)
+				local recolored = false
+				if curErr > skip and cur ~= nil and cur ~= -2 then
+					local ar, ag, ab, br, bg, bb, e = recolor(px, W, H, x0, y0, 8, pw, cur)
+					if e <= skip then
+						recolored = true
+						if pend then
+							table.insert(pend, { ci, cur, ar, ag, ab, br, bg, bb })
+						else
+							grid:set(ci, cur, ar, ag, ab, br, bg, bb)
+						end
+						used += 1
+					end
+				end
+				if curErr > skip and not recolored then
 					local kind, ar, ag, ab, br, bg, bb, pidx, e = fit(px, W, H, x0, y0, 8, pw)
 					local fits, e4
 					if e > self.BlockSplit and (cur == -2 or grid.splits < self.MaxSplits) then
@@ -537,11 +627,20 @@ local function workBlocks(self, unlimited)
 					end
 					if fits and e4 + 1.5 < e then
 						if e4 + 1 < curErr then
-							grid:setSplit(ci, fits)
+							if pend then
+								table.insert(pend, { ci, fits })
+							else
+								grid:setSplit(ci, fits)
+							end
 							used += 1
 						end
 					elseif e + 1 < curErr then
-						grid:set(ci, kind == "flat" and -1 or pidx, ar, ag, ab, br, bg, bb)
+						local idx = kind == "flat" and -1 or pidx
+						if pend then
+							table.insert(pend, { ci, idx, ar, ag, ab, br, bg, bb })
+						else
+							grid:set(ci, idx, ar, ag, ab, br, bg, bb)
+						end
 						used += 1
 					end
 				end
@@ -563,6 +662,10 @@ local function workBlocks(self, unlimited)
 	end
 	table.clear(q)
 	table.move(rest, 1, #rest, 1, q)
+	-- the whole picture worked out: shown in one go
+	if pend and #q == 0 and #pend > 0 then
+		commitBlocks(self)
+	end
 	return used, os.clock() - t0
 end
 
@@ -618,7 +721,17 @@ function Player:prepare()
 	end
 	local info
 	local start = self.Clock and math.floor(math.max(0, self.Clock()) * self.fps) or 0
-	if start > 0 and start < self.reader.frameCount then
+	if self.reader.async then
+		-- decoding on a worker: ask for the first picture and wait for it
+		local r = self.reader
+		r:seek((start > 0 and start < r.frameCount) and start or 0)
+		local t0 = os.clock()
+		while not r:ready(r.frame + 1) and os.clock() - t0 < 15 do
+			task.wait()
+		end
+		info = r:advance()
+		markAll(self)
+	elseif start > 0 and start < self.reader.frameCount then
 		-- joining a video that is already playing (a synced TV): start from where it is now
 		info = self.reader:seek(start)
 		markAll(self)
@@ -642,6 +755,9 @@ function Player:prepare()
 		end
 	else
 		retune(self, true)
+	end
+	if self.fitDirty and self.blocks then
+		commitFits(self)
 	end
 	while #q > 0 do
 		local y = table.remove(q, 1)
@@ -696,12 +812,38 @@ end
 -- several frames: old and new rows mixed, a visible struggle at every loop)
 local function jump(self)
 	self.jumped = true
+	self.drawT0 = nil
 	if self.blocks then
 		return -- (blocks have no gradient limit: the new picture is simply drawn over the next few frames)
 	end
 	if not self.redrawHidden then
 		self.redrawHidden = true
 		self.canvas.Board.Visible = false
+	end
+end
+
+-- the rate shown follows how long a picture takes to be worked out and shown: while pictures can't be finished in time
+-- it steps down to a half, then a third of the video's (24 -> 12 -> 8 fps: even motion instead of late, uneven
+-- frames), and back up once a picture takes well under the faster rate's time
+local function pace(self, dur)
+	self.drawEma = self.drawEma and self.drawEma * 0.8 + dur * 0.2 or dur
+	if not self.AutoQuality then
+		return
+	end
+	local now = os.clock()
+	if now < (self.paceAt or 0) then
+		return
+	end
+	local k = math.floor(self.FpsCap / self.MaxFps + 0.5)
+	local nk = k
+	if self.drawEma > 0.9 / self.MaxFps and k < 3 then
+		nk = k + 1
+	elseif k > 1 and self.drawEma < 0.5 * (k - 1) / self.FpsCap then
+		nk = k - 1
+	end
+	if nk ~= k then
+		self.MaxFps = self.FpsCap / nk
+		self.paceAt = now + 3
 	end
 end
 
@@ -754,11 +896,25 @@ local function step(self)
 			target = reader.frameCount - 1
 		end
 	end
+	-- paced: while the picture before is still being worked out, the reader isn't moved on
+	local hold = self.Batch and #self.queue > 0
 	local ready = reader.ready == nil or reader:ready(target)
 	self.Stats.buffering = not ready
 	if not ready then
 		-- a streamed video whose bytes haven't arrived: play on as far as they go, then hold the last picture
-		if target > reader.frame and target - reader.frame <= fps * 2 then
+		if reader.async then
+			-- (the worker isn't keeping up: counts as slow decoding, so the droppable half gets skipped)
+			self.decodeEma += self.TargetMs * 0.3
+		end
+		if (reader.direct or reader.blocks) and target - reader.frame > fps * 2 then
+			-- (a stream decoded here, Video.DirectReader, or the server's block picture, Video.BlockStream: a jump ahead
+			-- to frames not here yet, or fallen more than 2 s behind, goes straight to the spot and waits there, rather
+			-- than playing on from where it was)
+			reader:seek(target)
+			markAll(self)
+			jump(self)
+		elseif not hold and target > reader.frame and (reader.async or target - reader.frame <= fps * 2) then
+			-- (a reader decoding on a worker hands over its frames ready-made: it catches up)
 			while reader.frame < target and reader:ready(reader.frame + 1) do
 				applyFrame(self, reader:advance())
 			end
@@ -769,17 +925,23 @@ local function step(self)
 		markAll(self)
 		applyFrame(self, info)
 		jump(self)
+		self.Stats.buffering = reader.async == true -- (its picture there isn't decoded yet)
 	elseif target - reader.frame > fps * 2 then
 		reader:seek(target)
 		markAll(self)
 		jump(self)
-	else
-		while reader.frame < target do
+		self.Stats.buffering = reader.async == true
+	elseif not hold then
+		-- (a reader decoding on a worker may not have every frame yet: the rest next screen frame)
+		while reader.frame < target and reader:ready(reader.frame + 1) do
 			applyFrame(self, reader:advance())
 		end
 	end
 	if reader.render then
 		reader.render()
+	end
+	if self.fitDirty and self.blocks then
+		commitFits(self)
 	end
 	local decodeMs = (os.clock() - t0) * 1000
 	self.decodeEma = self.decodeEma * 0.9 + decodeMs * 0.1
@@ -793,6 +955,9 @@ local function step(self)
 		-- (after a jump - the loop going back to the start, a seek - the whole new picture is drawn over a few frames,
 		-- TargetMs x 5 each: drawn in one frame it would be a visible hitch every time the video loops)
 		if reader.frame ~= self.workedFrame or #self.queue > 0 and (self.workedFrame == nil or self.catchUp) then
+			if reader.frame ~= self.workedFrame and not self.jumped and not self.redrawHidden and not self.drawT0 then
+				self.drawT0 = now -- (a new picture: timed until it is shown)
+			end
 			self.workedFrame = reader.frame
 			local jumping = self.catchUp or self.jumped
 			self.jumped = false
@@ -818,6 +983,10 @@ local function step(self)
 	else
 		used, dt = work(self, false)
 	end
+	if self.drawT0 and #self.queue == 0 then
+		pace(self, os.clock() - self.drawT0)
+		self.drawT0 = nil
+	end
 	local ms = dt * 1000
 	if worked then
 		self.emaMs = self.emaMs * 0.9 + ms * 0.1
@@ -825,6 +994,7 @@ local function step(self)
 	local st = self.Stats
 	st.updates, st.ms, st.behind, st.frame = used, self.emaMs, #self.queue, reader.frame
 	st.decodeMs = self.decodeEma
+	st.fps, st.drawMs = self.MaxFps, (self.drawEma or 0) * 1000
 	if reader.layers == 2 then
 		-- FLV2: half the frames are droppable; skip them when shown at 12 fps or less, or when decoding is too heavy
 		local skip = reader.SkipDroppable
@@ -918,6 +1088,9 @@ end
 
 function Player:destroy()
 	self:stop()
+	if self.reader.close then
+		self.reader.close()
+	end
 	self.canvas:destroy()
 	self.rows = {}
 	self.endedEvent:Destroy()

@@ -12,6 +12,9 @@
 --   player:stop(); player:destroy()
 --
 -- Pass { Pool = existingPool } to share voices between players (one clip at a time per pool).
+-- A v3 clip can be a window onto a longer sound that arrives as it plays (FrameLab's streams): clip.base is the frame
+-- its first frame stands for, clip.frameCount the frames it holds, clip.duration the whole sound's length; frames
+-- outside it are silent. clip.want(t), when there, is told the time being played (so the window can follow it).
 -- player.pool.output is the AudioFader carrying the mix (wire an AudioAnalyzer to it to measure).
 -- { DeviceOutput = false } skips the speaker output (silent measuring).
 --
@@ -153,8 +156,21 @@ end
 -- takes its new pitch at once (it was silent), a voice that ends fades at its last pitch.
 function Player:_apply3(t)
 	local clip = self.clip
-	local fpos = t * clip.fps
+	if clip.want then
+		clip.want(t)
+	end
+	local fpos = t * clip.fps - (clip.base or 0)
 	local nfr = clip.frameCount
+	if clip.base and (fpos < 0 or fpos > nfr - 1) then
+		-- (a window clip: outside the frames it holds)
+		for v = 1, clip.slots do
+			self.pool:setVoice(v, 0, 0, 0)
+		end
+		for q = 1, clip.nN do
+			self.pool:setBand(clip.noise[q], 0, clip.nzR and 0 or nil)
+		end
+		return
+	end
 	local j0 = math.min(math.floor(fpos), nfr - 1)
 	local j1 = math.min(j0 + 1, nfr - 1)
 	local a = math.clamp(fpos - j0, 0, 1)
@@ -237,6 +253,10 @@ end
 
 function Player:_apply3block(t, span)
 	local clip = self.clip
+	if clip.want then
+		clip.want(t)
+	end
+	local base = clip.base or 0
 	local fps = clip.fps
 	local K = clip.slots
 	local pool = self.pool
@@ -246,7 +266,7 @@ function Player:_apply3block(t, span)
 	local taps = {}
 	for q = 1, BLOCK_TAPS do
 		local tq = t + span * ((q - 0.5) / BLOCK_TAPS - 0.5)
-		taps[q] = (tq >= 0 and tq <= dur) and tq * fps or -1
+		taps[q] = (tq >= 0 and tq <= dur and tq * fps - base >= 0) and tq * fps - base or -1
 	end
 	for v = 0, K - 1 do
 		local e, best, cents, any = 0, 0, 0, nil
@@ -279,7 +299,7 @@ function Player:_apply3block(t, span)
 		local eL, eR = 0, 0
 		for i = 1, BLOCK_TAPS do
 			local fp = taps[i]
-			if fp >= 0 then
+			if fp >= 0 and fp <= nfr then
 				local j0 = math.min(math.floor(fp), nfr - 1)
 				local j1 = math.min(j0 + 1, nfr - 1)
 				local a = math.clamp(fp - j0, 0, 1)
@@ -308,8 +328,9 @@ function Player:_prewarm(t, window)
 	local clip = self.clip
 	local K, fps, nfr = clip.slots, clip.fps, clip.frameCount
 	local amp, pitch = clip.amp, clip.pitch
-	local fa = math.clamp(math.floor(t * fps), 0, nfr - 1)
-	local fb = math.clamp(math.floor((t + window) * fps), fa, nfr - 1)
+	local base = clip.base or 0
+	local fa = math.clamp(math.floor(t * fps - base), 0, nfr - 1)
+	local fb = math.clamp(math.floor((t + window) * fps - base), fa, nfr - 1)
 	local peak = {}
 	for f = fa, fb, 2 do
 		local count = {}

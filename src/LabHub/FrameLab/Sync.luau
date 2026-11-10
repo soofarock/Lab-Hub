@@ -7,17 +7,22 @@
 --   local Sync = require(game.ReplicatedStorage.LabHub.FrameLab.Sync)
 --   Sync.play(screen, { Video = "intro", Loop = true })     -- also StartTime, Speed, Delay, Face, Sound (default true)
 --   Sync.pause(screen); Sync.resume(screen); Sync.seek(screen, 12.5); Sync.stop(screen); Sync.setSpeed(screen, 1.5)
+--   Sync.seek(screen, 12.5, hold): a playing screen's playhead waits at the new spot (at most `hold` seconds) until its
+--       controller's client has the picture there (it sends "ready"; Sync.release), like a video player loading after
+--       a jump; its sound waits with it
 --   Sync.getTime(screen, { duration =, loop = })             -- the server's playhead in seconds
 --   Sync.setClientControl(screen, true)                      -- clients may pause / seek / ... it (default: only its owner)
 --   Sync.setOwner(screen, player)                            -- that player may control it (TVs)
 --   Sync.authorize = function(player, target, action, arg) return true end   -- optional: veto client requests
 -- Client: Sync.request(screen, "play", { Video = "intro", Loop = true }) or "pause" | "resume" | "toggle" | "stop" |
---   "restart" | "seek" | "setSpeed", n. The server checks it (Runtime/Server/FrameLabServer).
+--   "restart" | "seek" | "setSpeed" | "ready" | "stall", n. The server checks it (Runtime/Server/FrameLabServer).
 -- In Studio: tag an instance "FrameLab", set FrameLabSynced = true, FrameLabAutoPlay = true, FrameLabVideo = "<name>"
 --   (and FrameLabLoop, FrameLabStartTime) and the server starts it.
 -- A video imported with its sound (attribute Audio = "clip:<name>") plays that sound through AudioLab.Sync on the same
 -- instance, so picture and sound share one playhead.
--- State attributes: FrameLabState ("playing" | "paused" | "stopped"), FrameLabPos, FrameLabAt, FrameLabSpeed, FrameLabSeq.
+-- State attributes: FrameLabState ("playing" | "paused" | "stopped"), FrameLabPos, FrameLabAt, FrameLabSpeed, FrameLabSeq,
+-- FrameLabHold (a held seek: the FrameLabSeq it waits on). A playing screen's playhead stays at FrameLabPos until
+-- FrameLabAt.
 
 local CollectionService = game:GetService("CollectionService")
 local RunService = game:GetService("RunService")
@@ -48,7 +53,7 @@ end
 
 function Sync.rawPosition(st, now)
 	if st.state == "playing" then
-		return st.pos + (now - st.at) * st.speed
+		return st.pos + math.max(0, now - st.at) * st.speed -- (a start ahead: held where it starts)
 	end
 	return st.pos
 end
@@ -132,11 +137,12 @@ local function mirrorSound(instance)
 	instance:SetAttribute("AudioLabSeq", (instance:GetAttribute("AudioLabSeq") or 0) + 1) -- last: clients react to it
 end
 
-local function write(instance, state, pos, at, speed)
+local function write(instance, state, pos, at, speed, hold)
 	instance:SetAttribute("FrameLabPos", pos)
 	instance:SetAttribute("FrameLabAt", at)
 	instance:SetAttribute("FrameLabSpeed", speed)
 	instance:SetAttribute("FrameLabState", state)
+	instance:SetAttribute("FrameLabHold", hold and (instance:GetAttribute("FrameLabSeq") or 0) + 1 or nil)
 	instance:SetAttribute("FrameLabSeq", (instance:GetAttribute("FrameLabSeq") or 0) + 1) -- last: clients react to it
 end
 
@@ -255,15 +261,50 @@ function Sync.stop(instance)
 	end)
 end
 
-function Sync.seek(instance, seconds)
+function Sync.seek(instance, seconds, hold)
 	serverOnly()
 	local st = Sync.state(instance)
 	if not st then
 		return
 	end
 	local now = serverNow()
+	if type(hold) == "number" and hold > 0 and st.state == "playing" then
+		-- held: the picture starts again when a client has it (Sync.release) or after `hold` seconds; the sound
+		-- waits paused at the spot meanwhile
+		local pos = math.max(0, seconds)
+		write(instance, "playing", pos, now + hold, st.speed, true)
+		local id = instance:GetAttribute("FrameLabHold")
+		if instance:GetAttribute("AudioLabState") ~= nil and soundOf(instance) then
+			instance:SetAttribute("AudioLabPos", pos)
+			instance:SetAttribute("AudioLabAt", now)
+			instance:SetAttribute("AudioLabSpeed", st.speed)
+			instance:SetAttribute("AudioLabState", "paused")
+			instance:SetAttribute("AudioLabSeq", (instance:GetAttribute("AudioLabSeq") or 0) + 1)
+		end
+		task.delay(hold, function()
+			if instance:GetAttribute("FrameLabHold") == id and instance:GetAttribute("FrameLabSeq") == id then
+				instance:SetAttribute("FrameLabHold", nil)
+				mirrorSound(instance) -- (not released in time: it plays on anyway, the sound with it)
+			end
+		end)
+		return
+	end
 	write(instance, st.state == "stopped" and "paused" or st.state, math.max(0, seconds), now, st.speed)
 	mirrorSound(instance)
+end
+
+-- a held seek goes on (its picture is there): hold is the FrameLabHold it answers
+function Sync.release(instance, hold)
+	serverOnly()
+	local st = Sync.state(instance)
+	if not st or st.state ~= "playing" or hold ~= st.seq or instance:GetAttribute("FrameLabHold") ~= hold then
+		return
+	end
+	local at = serverNow() + 0.15
+	if st.at > at then
+		write(instance, "playing", st.pos, at, st.speed)
+		mirrorSound(instance)
+	end
 end
 
 function Sync.setSpeed(instance, speed)

@@ -4,14 +4,16 @@
 
 Pictures, video and music in Roblox, decoded and drawn in-game, with no EditableImage and no song-specific audio uploads.
 
+**Version 1.1.0** · what's new: [CHANGELOG.md](CHANGELOG.md)
+
 | Part | What it does |
 | --- | --- |
-| **FrameLab** | Imports pictures (PNG, JPEG, WebP, GIF, BMP, TGA) and video (MP4/H.264, AVI) from a URL and draws them with GUI objects: gradient strips, plus block pictures for big sprays and 360p video. Includes a TV tool, a Spray Paint tool, a data manager and synced playback. |
-| **AudioLab** | Rebuilds MIDI + SoundFont music and WAV / AIFF / MP3 / AAC / OGG / FLAC sounds in-game from a small set of *generic* uploaded waveforms (sines, bundles, noise bands, textures), driven by AudioPlayers. Includes a music player. |
+| **FrameLab** | Imports pictures and video from a URL and draws them with GUI objects: gradient strips, plus block pictures for big sprays and 360p video. Long videos stream to the clients that play them, at the size each device keeps up with (360p imports keep a 180p copy), and HLS addresses (`.m3u8`) play as live streams. Includes a TV tool, a Spray Paint tool, a data manager and synced playback. Every decoder is written in Luau and runs in the game. |
+| **AudioLab** | Rebuilds MIDI + SoundFont music and WAV / AIFF / MP3 / AAC / Ogg Vorbis / Opus / FLAC / AC-3 sounds in-game from a small set of *generic* uploaded waveforms (sines, bundles, noise bands, textures), driven by AudioPlayers. Includes a music player. |
 | **VideoLab** | Video with sound from one file: FrameLab's picture plus AudioLab's sound, on one clock. |
 | **LabHub** | The package and its menu: a **Labs** button in the bottom-left corner that opens Music, Data and Settings. It also handles the owner-only settings panel (saved to a DataStore) and tool access. |
 
-LabHub is one ModuleScript made of ModuleScripts and Folders. The tools, the TV model and the audio preload list are built from Luau when the game starts.
+LabHub is one ModuleScript made of ModuleScripts and Folders, plus a few switched-off scripts: the templates for the parallel import workers and the client decode workers. The tools, the TV model and the audio preload list are built from Luau when the game starts.
 
 ## Install
 
@@ -32,6 +34,17 @@ LabHub is one ModuleScript made of ModuleScripts and Folders. The tools, the TV 
 
 `start()` runs once per side; calling it again does nothing.
 
+### What FrameLab reads
+
+| Kind | Formats |
+| --- | --- |
+| Pictures | PNG, JPEG, WebP, GIF, BMP, TGA, HEIC / HEIF (iPhone photos), AVIF (with transparency) |
+| Animations | GIF, WebP, APNG |
+| Video | MP4 / MOV / M4V (H.264, H.265, AV1, MPEG-4 Part 2), WebM (VP9, VP8, AV1), MKV (VP9, VP8, AV1, H.264, H.265, MPEG-4 Part 2), AVI / DivX, MPEG-1 / MPEG-2 (`.mpg`, `.vob`), transport streams (`.ts`, `.m2ts`), HLS streams (`.m3u8`) |
+| Sound tracks | AAC, MP3, MP2, Opus, Vorbis, FLAC, AC-3 (surround is mixed down to stereo) |
+
+Video sources up to 1080p are shrunk to the import size as they are read.
+
 ### The tools
 
 The **TV** and **Spray Paint** tools are built by LabHub and handed out to players according to the settings `TVToolAccess` and `SprayToolAccess`: everyone, admins, owner, list or nobody. To use a tool of your own instead, put a Tool with the same name in StarterPack.
@@ -43,7 +56,12 @@ As the owner, open **Labs → Settings** in game. A change applies at once, and 
 | Setting | What it does |
 | --- | --- |
 | `Admins`, `ToolAccessList` | People, as UserIds or usernames, comma-separated. The settings panel has a picker for these. |
-| `ImportVideoQuality` | `144p` / `240p` / `360p` |
+| `ImportVideoQuality` | `144p` / `240p` / `360p` (240p and 360p keep a smaller copy for slower devices) |
+| `VideoRendition` | Which size a client plays: `auto` (the smaller one) / `high` / `low`; a client that falls behind steps down |
+| `VideoCacheMB` | Video a client keeps in memory while it plays (MB); the admins see each player's use in **Labs → Data → Clients** |
+| `ImportWorkers` | Parallel workers (Actors) an MP4 / MOV import is split over in a running game |
+| `VideoDecode` | Streams: `auto` (each client decodes the H.264 itself, and falls back to the server's converted copy if it falls behind) / `client` / `server` |
+| `StreamMaxSourceLines`, `StreamMaxSeconds` | The tallest video the TV's Stream switch streams, and the longest HLS stream played |
 | `SprayPerformanceMode` | `auto` (phones) / `on` / `off` |
 | `ImageWhitelistEnabled`, `ImageWhitelist`, `ImageBlacklistEnabled`, `ImageBlacklist` | Which sites pictures may come from. |
 | `LibraryDataStore` | Keep import records (URL + a 64×64 thumbnail). Off by default. |
@@ -135,7 +153,7 @@ This takes `ReplicatedStorage.LabHub` from the place and cleans it:
 
 - settings go back to their defaults, with no admins and no lists;
 - bundled media, test modules and the debug viewer are removed;
-- anything in LabHub that isn't a ModuleScript or a Folder stops the build;
+- anything in LabHub that isn't a ModuleScript, a Folder or a switched-off script template (FrameLab's import and decode workers) stops the build;
 - every text is checked against your private words file (your name, UserId, local paths…), and any match stops the build. Keep that file **outside** the repo.
 
 It then writes `release/LabHub.rbxmx`, `src/LabHub` and `assets/audio/manifest.csv`.

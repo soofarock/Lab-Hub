@@ -8,7 +8,8 @@
 --   src/LabHub/...          every module as a .luau file (Rojo layout; `rojo build -o LabHub.rbxmx` rebuilds the model);
 --                           the README.md files already in src/LabHub are kept
 --   assets/audio/manifest.csv   name, asset id, profiles, file and length of every generic audio upload
--- LabHub is ModuleScripts and Folders only; anything else in it stops the build.
+-- LabHub is ModuleScripts and Folders, plus childless Scripts and LocalScripts kept switched off (templates the code
+-- clones, such as FrameLab's import and decode workers); anything else in it stops the build.
 --
 -- Cleaning (your working place is not changed):
 --   * settings (attributes on FrameLab) go back to their defaults from LabHub.Config: no Admins, no ToolAccessList,
@@ -242,8 +243,20 @@ fs.writeFile("release/LabHub.rbxmx", roblox.serializeModel({ hub }, true))
 --   a ModuleScript is <name>.luau, or a folder with init.luau when it has children; a Folder is a folder. Attributes
 --   go in <name>.meta.json / init.meta.json.
 for _, d in { hub, table.unpack(hub:GetDescendants()) } do
-	if d.ClassName ~= "ModuleScript" and d.ClassName ~= "Folder" then
-		fail(d:GetFullName() .. " is a " .. d.ClassName .. " (LabHub is ModuleScripts and Folders only)")
+	if d.ClassName == "Script" or d.ClassName == "LocalScript" then
+		local okE, on = pcall(function()
+			return d.Enabled
+		end)
+		if not okE then
+			okE, on = pcall(function()
+				return not d.Disabled
+			end)
+		end
+		if #d:GetChildren() > 0 or on == true then
+			fail(d:GetFullName() .. " is a " .. d.ClassName .. " with children or switched on (a script in LabHub is a switched-off template)")
+		end
+	elseif d.ClassName ~= "ModuleScript" and d.ClassName ~= "Folder" then
+		fail(d:GetFullName() .. " is a " .. d.ClassName .. " (LabHub is ModuleScripts, Folders and switched-off scripts)")
 	end
 end
 local function attrsJson(inst: Instance): { [string]: any }?
@@ -285,7 +298,17 @@ local function emit(inst: Instance, dir: string)
 	end
 	local kids = inst:GetChildren()
 	local attrs = attrsJson(inst)
-	if inst.ClassName == "ModuleScript" then
+	if inst.ClassName == "Script" then
+		-- (a switched-off template: <name>.server.luau)
+		fs.writeFile(dir .. "/" .. name .. ".server.luau", inst.Source)
+		fs.writeFile(dir .. "/" .. name .. ".meta.json", serde.encode("json", { properties = { Disabled = true }, attributes = attrs }, true))
+		fileCount += 1
+	elseif inst.ClassName == "LocalScript" then
+		-- (a switched-off template: <name>.client.luau)
+		fs.writeFile(dir .. "/" .. name .. ".client.luau", inst.Source)
+		fs.writeFile(dir .. "/" .. name .. ".meta.json", serde.encode("json", { properties = { Disabled = true }, attributes = attrs }, true))
+		fileCount += 1
+	elseif inst.ClassName == "ModuleScript" then
 		if #kids == 0 then
 			fs.writeFile(dir .. "/" .. name .. ".luau", inst.Source)
 			if attrs then

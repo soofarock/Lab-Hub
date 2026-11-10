@@ -284,7 +284,7 @@ T.g_win = {
 }
 T.g_hz = { 44100, 48000, 32000 }
 
--- MPEG-1 / MPEG-2 / MPEG-2.5 Layer III decoder in pure Luau (no Roblox APIs).
+-- MPEG-1 / MPEG-2 / MPEG-2.5 audio decoder (Layer III, and Layer I / II: MP2) in pure Luau (no Roblox APIs).
 -- A port of minimp3 by Lion (lieff), CC0 / public domain: https://github.com/lieff/minimp3
 --
 --   local result = Mp3.decode(bytes: buffer, options?)
@@ -296,7 +296,7 @@ T.g_hz = { 44100, 48000, 32000 }
 --   Mp3.probe(bytes) -> { sampleRate, channels, bitrate, layer, offset } or nil
 --
 -- Gapless: ID3v2/ID3v1 tags are skipped and a Xing/Info/LAME header's encoder delay and padding are
--- trimmed, as minimp3_ex does. Layer I/II streams are rejected.
+-- trimmed, as minimp3_ex does.
 
 local Mp3 = {}
 
@@ -1156,6 +1156,150 @@ local function synthGranule(qmf, g, nbands, nch, pcm, pcmOff, lins)
 	end
 end
 
+-- Layer I / II --------------------------------------------------------------------------------
+-- bit allocation codes per subband group ({ table offset, code width, bands })
+local L12_BA_CODES = {
+	0, 17, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+	0, 17, 18, 3, 19, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16,
+	0, 17, 18, 3, 19, 4, 5, 16,
+	0, 17, 18, 16,
+	0, 17, 18, 19, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+	0, 17, 18, 3, 19, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+	0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+}
+local L12_DEQ = {}
+do
+	local den = { 3, 7, 15, 31, 63, 127, 255, 511, 1023, 2047, 4095, 8191, 16383, 32767, 65535, 3, 5, 9 }
+	for i, x in ipairs(den) do
+		L12_DEQ[3 * i - 2] = 9.53674316e-07 / x
+		L12_DEQ[3 * i - 1] = 7.56931807e-07 / x
+		L12_DEQ[3 * i] = 6.00777173e-07 / x
+	end
+end
+local ALLOC_L1 = { { 76, 4, 32 } }
+local ALLOC_L2M2 = { { 60, 4, 4 }, { 44, 3, 7 }, { 44, 2, 19 } }
+local ALLOC_L2M1 = { { 0, 4, 3 }, { 16, 4, 8 }, { 32, 3, 12 }, { 40, 2, 7 } }
+local ALLOC_L2M1_LOW = { { 44, 4, 2 }, { 44, 3, 10 } }
+
+local function l12ScaleInfo(h, bs, sci)
+	local mode = rsh(h[4], 6)
+	local stereoBands = 32
+	if mode == 3 then
+		stereoBands = 0
+	elseif mode == 1 then
+		stereoBands = band(rsh(h[4], 4), 3) * 4 + 4
+	end
+	local alloc, nbands
+	if isLayer1(h) then
+		alloc, nbands = ALLOC_L1, 32
+	elseif not isMpeg1(h) then
+		alloc, nbands = ALLOC_L2M2, 30
+	else
+		local kbps = rsh(bitrateKbps(h), mode ~= 3 and 1 or 0)
+		if kbps == 0 then
+			kbps = 192
+		end
+		alloc, nbands = ALLOC_L2M1, 27
+		if kbps < 56 then
+			alloc, nbands = ALLOC_L2M1_LOW, getSampleRate(h) == 2 and 12 or 8
+		elseif kbps >= 96 and getSampleRate(h) ~= 1 then
+			nbands = 30
+		end
+	end
+	stereoBands = min(stereoBands, nbands)
+	sci.total, sci.stereo = nbands, stereoBands
+	local ba, scfcod, scf = sci.bitalloc, sci.scfcod, sci.scf
+	local k, bits, off, ai = 0, 0, 0, 0
+	for i = 0, nbands - 1 do
+		if i == k then
+			ai += 1
+			local a = alloc[ai]
+			k += a[3]
+			bits, off = a[2], a[1]
+		end
+		local v = L12_BA_CODES[off + getBits(bs, bits) + 1]
+		ba[2 * i + 1] = v
+		if i < stereoBands then
+			v = L12_BA_CODES[off + getBits(bs, bits) + 1]
+		end
+		ba[2 * i + 2] = stereoBands > 0 and v or 0
+	end
+	local layer1 = isLayer1(h)
+	for i = 1, 2 * nbands do
+		if ba[i] ~= 0 then
+			scfcod[i] = layer1 and 2 or getBits(bs, 2)
+		else
+			scfcod[i] = 6
+		end
+	end
+	local si = 1
+	for i = 1, 2 * nbands do
+		local s = 0
+		local b = ba[i]
+		local mask = b ~= 0 and (4 + band(rsh(19, scfcod[i]), 3)) or 0
+		local m = 4
+		while m > 0 do
+			if band(mask, m) ~= 0 then
+				local v = getBits(bs, 6)
+				s = L12_DEQ[b * 3 - 6 + v % 3 + 1] * rsh(2097152, v // 3)
+			end
+			scf[si] = s
+			si += 1
+			m = rsh(m, 1)
+		end
+	end
+	for i = stereoBands, nbands - 1 do
+		ba[2 * i + 2] = 0
+	end
+end
+
+-- one group of samples per subband (4 x groupSize each) into g from goff (0-based): channel 1 at +576
+local function l12Dequantize(g, goff, bs, sci, groupSize)
+	local choff = 576
+	local ba = sci.bitalloc
+	for j = 0, 3 do
+		local dst = goff + groupSize * j
+		for i = 1, 2 * sci.total do
+			local b = ba[i]
+			if b ~= 0 then
+				if b < 17 then
+					local half = lsh(1, b - 1) - 1
+					for k = 0, groupSize - 1 do
+						g[dst + k + 1] = getBits(bs, b) - half
+					end
+				else
+					local mod = lsh(2, b - 17) + 1
+					local code = getBits(bs, mod + 2 - rsh(mod, 3))
+					for k = 0, groupSize - 1 do
+						g[dst + k + 1] = code % mod - mod // 2
+						code = code // mod
+					end
+				end
+			end
+			dst += choff
+			choff = 18 - choff
+		end
+	end
+	return groupSize * 4
+end
+
+local function l12ApplyScf(sci, scfOff, g)
+	for k = sci.stereo * 18 + 1, sci.total * 18 do
+		g[576 + k] = g[k]
+	end
+	local scf = sci.scf
+	local dst, s = 0, scfOff
+	for _ = 1, sci.total do
+		local s0, s1 = scf[s + 1], scf[s + 4]
+		for k = 1, 12 do
+			g[dst + k] *= s0
+			g[dst + 576 + k] *= s1
+		end
+		dst += 18
+		s += 6
+	end
+end
+
 -- frames ------------------------------------------------------------------------------------
 local function matchFrame(b, o, bytes, fb)
 	local h = hdrAt(b, o)
@@ -1220,6 +1364,7 @@ local function newDecoder()
 		ist = { table.create(39, 0), table.create(39, 0) },
 		maxBand = table.create(3, 0),
 		mbs = { buf = nil, base = 0, pos = 0, limit = 0 },
+		sci = { bitalloc = table.create(64, 0), scfcod = table.create(64, 0), scf = table.create(192, 0), total = 0, stereo = 0 },
 	}
 	return d
 end
@@ -1321,12 +1466,37 @@ local function decodeFrame(d, b, o, n, pcm)
 	local nch = isMono(h) and 1 or 2
 	local hz = sampleRateHz(h)
 	local layer = 4 - getLayer(h)
-	if layer ~= 3 then
-		error("MP3: only MPEG Layer III is supported (this stream is Layer " .. layer .. ")", 0)
-	end
 	local bs = { buf = b, base = o + i + 4, pos = 0, limit = (frameSize - 4) * 8 }
 	if isCrc(h) then
 		getBits(bs, 16)
+	end
+	if layer ~= 3 then
+		-- Layer I (384 samples) / II (1152): three runs of 12 samples per subband (Layer I: one)
+		local sci = d.sci
+		l12ScaleInfo(h, bs, sci)
+		local g = d.grbuf
+		for k = 1, 1152 do
+			g[k] = 0
+		end
+		local filled, pcmOff = 0, 0
+		local groupSize = layer == 1 and 1 or 3
+		for igr = 0, 2 do
+			filled += l12Dequantize(g, filled, bs, sci, groupSize)
+			if filled == 12 then
+				filled = 0
+				l12ApplyScf(sci, igr, g)
+				synthGranule(d.qmf, g, 12, nch, pcm, pcmOff, d.syn)
+				for k = 1, 1152 do
+					g[k] = 0
+				end
+				pcmOff += 384 * nch
+			end
+			if bs.pos > bs.limit then
+				resetDecoder(d)
+				return 0, i + frameSize, nch, hz
+			end
+		end
+		return frameSamples(h), i + frameSize, nch, hz
 	end
 	local mainDataBegin = readSideInfo(bs, d.grs, h)
 	if mainDataBegin < 0 or bs.pos > bs.limit then
@@ -1461,12 +1631,12 @@ function Mp3.decode(b, options)
 	local channels = isMono(fh) and 1 or 2
 	local rate = sampleRateHz(fh)
 	local bitrate = bitrateKbps(fh)
-	if 4 - getLayer(fh) ~= 3 then
-		error("MP3: only MPEG Layer III is supported", 0)
-	end
 	local pos = start + first
 	local toSkip, padding, expected = 0, 0, nil
-	local vbr, frames, delay, pad = checkVbrTag(b, pos, fsize)
+	local vbr, frames, delay, pad = 0, 0, 0, 0
+	if 4 - getLayer(fh) == 3 then
+		vbr, frames, delay, pad = checkVbrTag(b, pos, fsize)
+	end
 	if vbr ~= 0 then
 		pos += fsize -- the tag frame carries no audio
 		if vbr > 0 then

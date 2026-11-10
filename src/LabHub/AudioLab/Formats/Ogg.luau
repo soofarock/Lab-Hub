@@ -4,7 +4,8 @@
 -- sparse, lookup types 1 and 2), floor type 1, residue types 0 / 1 / 2, channel coupling, short / long blocks with
 -- the Vorbis power-sine window, and the end trim from the last page's granule position. Written from the Vorbis I
 -- specification; stb_vorbis (public domain) was the reference for the codeword assignment. Floor type 0 (only
--- pre-1.0 encoders made it) and Opus / FLAC inside Ogg are reported as unsupported.
+-- pre-1.0 encoders made it) and FLAC inside Ogg are reported as unsupported. An Ogg Opus file (.opus) is decoded by
+-- Formats.Opus and comes back in the same shape (codec "opus", 48 kHz).
 -- Checked against ffmpeg's decoder (libvorbis q0-q10 and ffmpeg's own encoder, mono / stereo / 5.1, 22-48 kHz):
 -- sample-for-sample within float rounding (difference ~134 dB under the signal), same length.
 -- Channels come out in the WAV / FLAC order (L, R, C, LFE, rear / side).
@@ -981,7 +982,13 @@ function Ogg.decode(bytes, options)
 	local p1 = packets[1].buf
 	local magic = buffer.len(p1) >= 8 and buffer.readstring(p1, 0, 8) or ""
 	if magic == "OpusHead" then
-		error("OGG: this file holds Opus audio; only Vorbis is supported for now", 0)
+		local opusModule = script.Parent:FindFirstChild("Opus")
+		if not opusModule then
+			error("OGG: this file holds Opus audio, and the Opus decoder (AudioLab.Formats.Opus) is missing", 0)
+		end
+		local signal = require(opusModule).decodeOgg(buf, options)
+		return { signal = signal, format = { codec = "opus", sampleRate = signal.sampleRate, channels = signal.channels,
+			bitrate = math.floor(buffer.len(buf) * 8 / math.max(signal.length / signal.sampleRate, 1e-3)) } }
 	elseif buffer.readstring(p1, 0, math.min(5, buffer.len(p1))) == "\x7FFLAC" then
 		error("OGG: this file holds FLAC audio inside Ogg; save it as a plain .flac", 0)
 	elseif buffer.len(p1) < 30 or readu8(p1, 0) ~= 1 or buffer.readstring(p1, 1, 6) ~= "vorbis" then

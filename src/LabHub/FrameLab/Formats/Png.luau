@@ -283,4 +283,190 @@ function Png.decode(bytes, options)
 	return { width = width, height = height, data = out, hasAlpha = hasAlpha }
 end
 
+-- APNG: the frames of an animated PNG, composited the way browsers show them (dispose and blend operations)
+--   Png.isAnimated(bytes) -> true for an APNG (an acTL chunk before the image data)
+--   local anim = Png.decodeAnimation(bytes, options)
+--   anim.width, anim.height, anim.frames = { { data = RGBA buffer (full canvas), delay = seconds } }, anim.loop,
+--   anim.hasAlpha; a file without an animation gives its one picture as the only frame
+
+function Png.isAnimated(bytes)
+	local b = type(bytes) == "string" and buffer.fromstring(bytes) or bytes
+	if not Png.isPng(b) then
+		return false
+	end
+	local len, pos = buffer.len(b), 8
+	while pos + 8 <= len do
+		local clen = be32(b, pos)
+		local kind = buffer.readstring(b, pos + 4, 4)
+		if kind == "acTL" then
+			return true
+		elseif kind == "IDAT" or kind == "IEND" then
+			return false
+		end
+		pos += 12 + clen
+	end
+	return false
+end
+
+-- a chunk (length, type, data, a CRC the decoder doesn't check)
+local function putChunk(out, o, kind, src, at, n)
+	buffer.writeu32(out, o, bit32.byteswap(n))
+	buffer.writestring(out, o + 4, kind)
+	if n > 0 then
+		buffer.copy(out, o + 8, src, at, n)
+	end
+	buffer.writeu32(out, o + 8 + n, 0)
+	return o + 12 + n
+end
+
+function Png.decodeAnimation(bytes, options)
+	local b = type(bytes) == "string" and buffer.fromstring(bytes) or bytes
+	if not Png.isPng(b) then
+		error("PNG: not a PNG file")
+	end
+	local len, pos = buffer.len(b), 8
+	local ihdr, plte, trns, loop
+	local frames, cur, seenIdat = {}, nil, false
+	while pos + 8 <= len do
+		local clen = be32(b, pos)
+		local kind = buffer.readstring(b, pos + 4, 4)
+		local data = pos + 8
+		if data + clen > len then
+			error("PNG: truncated chunk " .. kind)
+		end
+		if kind == "IHDR" then
+			ihdr = data
+		elseif kind == "PLTE" then
+			plte = { data, clen }
+		elseif kind == "tRNS" then
+			trns = { data, clen }
+		elseif kind == "acTL" and clen >= 8 then
+			loop = be32(b, data + 4) == 0
+		elseif kind == "fcTL" and clen >= 26 then
+			local num, den = buffer.readu8(b, data + 20) * 256 + buffer.readu8(b, data + 21), buffer.readu8(b, data + 22) * 256 + buffer.readu8(b, data + 23)
+			if den == 0 then
+				den = 100
+			end
+			cur = {
+				w = be32(b, data + 4), h = be32(b, data + 8), x = be32(b, data + 12), y = be32(b, data + 16),
+				delay = num / den, dispose = buffer.readu8(b, data + 24), blend = buffer.readu8(b, data + 25), parts = {},
+			}
+			table.insert(frames, cur)
+		elseif kind == "IDAT" then
+			if not seenIdat and #frames == 0 then
+				cur = nil -- (a default picture that is not part of the animation)
+			end
+			seenIdat = true
+			if cur then
+				table.insert(cur.parts, { data, clen })
+			end
+		elseif kind == "fdAT" and cur and clen > 4 then
+			table.insert(cur.parts, { data + 4, clen - 4 })
+		elseif kind == "IEND" then
+			break
+		end
+		pos = data + clen + 4
+	end
+	if not ihdr then
+		error("PNG: no IHDR")
+	end
+	local W, H = be32(b, ihdr), be32(b, ihdr + 4)
+	if #frames == 0 then
+		local img = Png.decode(b, options)
+		return { width = img.width, height = img.height, frames = { { data = img.data, delay = 0.1 } }, hasAlpha = img.hasAlpha, loop = true }
+	end
+	local canvas = buffer.create(W * H * 4)
+	local out = {}
+	local hasAlpha = false
+	for i, f in ipairs(frames) do
+		if #f.parts == 0 or f.w < 1 or f.h < 1 or f.x + f.w > W or f.y + f.h > H then
+			error(("APNG: frame %d is broken"):format(i), 0)
+		end
+		-- the frame as a picture of its own: the file's header at the frame's size, its palette, its data
+		local total = 0
+		for _, p in ipairs(f.parts) do
+			total += p[2]
+		end
+		local mini = buffer.create(8 + 25 + (plte and 12 + plte[2] or 0) + (trns and 12 + trns[2] or 0) + 12 + total + 12)
+		buffer.writestring(mini, 0, "\137PNG\r\n\26\n")
+		local o = putChunk(mini, 8, "IHDR", b, ihdr, 13)
+		buffer.writeu32(mini, 16, bit32.byteswap(f.w))
+		buffer.writeu32(mini, 20, bit32.byteswap(f.h))
+		if plte then
+			o = putChunk(mini, o, "PLTE", b, plte[1], plte[2])
+		end
+		if trns then
+			o = putChunk(mini, o, "tRNS", b, trns[1], trns[2])
+		end
+		buffer.writeu32(mini, o, bit32.byteswap(total))
+		buffer.writestring(mini, o + 4, "IDAT")
+		local q = o + 8
+		for _, p in ipairs(f.parts) do
+			buffer.copy(mini, q, b, p[1], p[2])
+			q += p[2]
+		end
+		buffer.writeu32(mini, q, 0)
+		putChunk(mini, q + 4, "IEND", mini, 0, 0)
+		local img = Png.decode(mini, options)
+		local src = img.data
+		local dispose = f.dispose
+		if i == 1 and dispose == 2 then
+			dispose = 1
+		end
+		local saved
+		if dispose == 2 then
+			saved = buffer.create(f.w * f.h * 4)
+			for r = 0, f.h - 1 do
+				buffer.copy(saved, r * f.w * 4, canvas, ((f.y + r) * W + f.x) * 4, f.w * 4)
+			end
+		end
+		-- draw: replace (SOURCE) or alpha-composite (OVER) the region
+		for r = 0, f.h - 1 do
+			local so = r * f.w * 4
+			local d = ((f.y + r) * W + f.x) * 4
+			if f.blend == 0 or i == 1 then
+				buffer.copy(canvas, d, src, so, f.w * 4)
+			else
+				for c = 0, f.w - 1 do
+					local s4, d4 = so + c * 4, d + c * 4
+					local sa = buffer.readu8(src, s4 + 3)
+					if sa == 255 then
+						buffer.writeu32(canvas, d4, buffer.readu32(src, s4))
+					elseif sa > 0 then
+						local da = buffer.readu8(canvas, d4 + 3)
+						local a = sa * 255 + da * (255 - sa) -- (out alpha x 255)
+						for k = 0, 2 do
+							local v = (buffer.readu8(src, s4 + k) * sa * 255 + buffer.readu8(canvas, d4 + k) * da * (255 - sa)) / a
+							buffer.writeu8(canvas, d4 + k, math.floor(v + 0.5))
+						end
+						buffer.writeu8(canvas, d4 + 3, math.floor(a / 255 + 0.5))
+					end
+				end
+			end
+		end
+		local snap = buffer.create(W * H * 4)
+		buffer.copy(snap, 0, canvas)
+		if not hasAlpha then
+			for k = 3, W * H * 4 - 1, 4 do
+				if buffer.readu8(snap, k) < 255 then
+					hasAlpha = true
+					break
+				end
+			end
+		end
+		-- browsers show delays of 10 ms and under as 100 ms
+		table.insert(out, { data = snap, delay = f.delay <= 0.01 and 0.1 or f.delay })
+		if dispose == 1 then
+			for r = 0, f.h - 1 do
+				buffer.fill(canvas, ((f.y + r) * W + f.x) * 4, 0, f.w * 4)
+			end
+		elseif dispose == 2 then
+			for r = 0, f.h - 1 do
+				buffer.copy(canvas, ((f.y + r) * W + f.x) * 4, saved, r * f.w * 4, f.w * 4)
+			end
+		end
+	end
+	return { width = W, height = H, frames = out, hasAlpha = hasAlpha, loop = loop ~= false }
+end
+
 return Png

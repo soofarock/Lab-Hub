@@ -111,10 +111,27 @@ return function(FrameLab)
 				Sync.resume(inst)
 			end
 		end,
-		seek = function(inst, n) Sync.seek(inst, math.max(n, 0)) end,
+		-- (a playing screen's playhead waits at the new spot until the controller's picture is there: "ready")
+		seek = function(inst, n)
+			local srv = FrameLab.Server
+			if srv and srv.prefetch then
+				pcall(srv.prefetch, inst:GetAttribute("FrameLabVideo"), n) -- (a stream: its segment there, downloading now)
+			end
+			Sync.seek(inst, math.max(n, 0), Config.SeekHold or 8)
+		end,
+		ready = function(inst, n) Sync.release(inst, n) end,
+		-- the controller's picture is stuck loading while it plays: the playhead waits where it is (a held seek to the
+		-- spot), like a video player buffering
+		stall = function(inst)
+			local st = Sync.state(inst)
+			if st and st.state == "playing" and inst:GetAttribute("FrameLabHold") == nil then
+				local d = inst:GetAttribute("FrameLabDuration") or 0
+				Sync.seek(inst, Sync.getTime(inst, { duration = d, loop = inst:GetAttribute("FrameLabLoop") == true }), Config.SeekHold or 8)
+			end
+		end,
 		setSpeed = function(inst, n) Sync.setSpeed(inst, math.clamp(n, 0.25, 4)) end,
 	}
-	local NEEDS_NUMBER = { seek = true, setSpeed = true }
+	local NEEDS_NUMBER = { seek = true, setSpeed = true, ready = true }
 
 	control.OnServerEvent:Connect(function(player, target, action, arg)
 		if type(action) ~= "string" or not allowed(player, Config.ControlPerSecond or 8) then
